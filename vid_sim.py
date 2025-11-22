@@ -220,6 +220,40 @@ while True:
                 nav_roi_mode = "custom_rect"
                 print(f"Auto-switching to ROI Mode: {nav_roi_mode}")
 
+            # Control Visualization (P-Controller)
+            # Robot always moves forward, steering adjusts heading
+            Kp = 1.0  # Visualization gain
+            steering = int(error * Kp)
+
+            # Draw arrow from bottom center indicating steering direction
+            # Fixed forward magnitude (e.g., 100 pixels)
+            arrow_start = (center_x, height)
+            arrow_end = (center_x + steering, height - 100)
+            cv2.arrowedLine(
+                frame, arrow_start, arrow_end, (255, 0, 255), 5, tipLength=0.3
+            )
+
+            # Determine action text
+            if abs(error) < 20:
+                action_text = "FORWARD"
+                action_color = (0, 255, 0)
+            elif error > 0:
+                action_text = f"RIGHT ({abs(error)})"
+                action_color = (0, 165, 255)  # Orange
+            else:
+                action_text = f"LEFT ({abs(error)})"
+                action_color = (0, 165, 255)
+
+            cv2.putText(
+                frame,
+                f"Action: {action_text}",
+                (10, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                action_color,
+                2,
+            )
+
             # Visualization
             # Draw the ROI area
             roi_contours, _ = cv2.findContours(
