@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 from ultralytics import YOLO
 
 # cap = cv2.VideoCapture("rsrc/camera_recording_20251121_045141.mp4")
@@ -29,11 +30,15 @@ fps = cap.get(cv2.CAP_PROP_FPS)
 # ROI State
 nav_roi_mode = "custom_rect"
 
+# FSM State
+fsm_state = "FOLLOW_LANE"  # States: FOLLOW_LANE, STOP_WAIT
+stop_start_time = 0
+wait_duration = 3.0
+pending_roi_mode = None
+last_stop_time = 0
+stop_cooldown = 5.0  # Seconds before another stop sign can be accepted
+
 print("Video Controls:")
-print("  A - ROI Bottom Left")
-print("  D - ROI Bottom Right")
-print("  S - ROI Custom Rect")
-print("  W - ROI Bottom (Reset)")
 print("  ESC - Exit")
 print()
 
@@ -110,28 +115,87 @@ while True:
     # Sign ROI Logic
     sign_roi_y_top = int(height * 0.75)
     cv2.line(frame, (0, sign_roi_y_top), (width, sign_roi_y_top), (0, 0, 255), 2)
-    sign_roi_y_bottom = int(height * 0.85)
+    sign_roi_y_bottom = int(height * 0.8)
     cv2.line(frame, (0, sign_roi_y_bottom), (width, sign_roi_y_bottom), (0, 0, 255), 2)
 
-    for det in detections:
-        _, y1, _, _ = det["box"]
-        if y1 > sign_roi_y_top and y1 < sign_roi_y_bottom:
-            if det["class_name"] == "left":
+    # FSM Logic
+    if fsm_state == "FOLLOW_LANE":
+        stop_detected = False
+        direction_detected = None
+
+        # Check detections
+        for det in detections:
+            _, y1, _, _ = det["box"]
+            if y1 > sign_roi_y_top and y1 < sign_roi_y_bottom:
+                if det["class_name"] == "stop":
+                    # Check cooldown
+                    if time.time() - last_stop_time > stop_cooldown:
+                        stop_detected = True
+                elif det["class_name"] in ["left", "right", "forward"]:
+                    direction_detected = det["class_name"]
+
+        if stop_detected:
+            fsm_state = "STOP_WAIT"
+            stop_start_time = time.time()
+
+            # Determine pending action based on direction sign
+            if direction_detected == "left":
+                pending_roi_mode = "bottom_left"
+            elif direction_detected == "right":
+                pending_roi_mode = "bottom_right"
+            elif direction_detected == "forward":
+                pending_roi_mode = "custom_rect"
+            else:
+                pending_roi_mode = None  # Default to current or custom_rect
+
+            print(
+                f"STOP SIGN DETECTED. Waiting 3s... Pending Action: {pending_roi_mode}"
+            )
+
+        elif direction_detected:
+            # Immediate transition if no stop sign
+            if direction_detected == "left":
                 nav_roi_mode = "bottom_left"
                 print(f"Sign Detected: left -> Switching to {nav_roi_mode}")
-            elif det["class_name"] == "right":
+            elif direction_detected == "right":
                 nav_roi_mode = "bottom_right"
                 print(f"Sign Detected: right -> Switching to {nav_roi_mode}")
-            elif det["class_name"] == "forward":
+            elif direction_detected == "forward":
                 nav_roi_mode = "custom_rect"
                 print(f"Sign Detected: forward -> Switching to {nav_roi_mode}")
+
+    elif fsm_state == "STOP_WAIT":
+        elapsed = time.time() - stop_start_time
+        remaining = int(wait_duration - elapsed) + 1
+
+        # Visualization for STOP
+        cv2.putText(
+            frame,
+            f"STOP: {remaining}s",
+            (width // 2 - 100, height // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2,
+            (0, 0, 255),
+            4,
+        )
+
+        if elapsed >= wait_duration:
+            fsm_state = "FOLLOW_LANE"
+            last_stop_time = time.time()  # Start cooldown
+
+            if pending_roi_mode:
+                nav_roi_mode = pending_roi_mode
+                print(f"Wait complete. Switching to {nav_roi_mode}")
+            else:
+                print("Wait complete. Continuing forward.")
+
+            pending_roi_mode = None
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, lower_range, upper_range)
 
     # ROI configuration
     # Modes: 'bottom', 'bottom_left', 'bottom_right', 'custom_rect', 'polygon'
-    # nav_roi_mode is controlled by keyboard input
     # For bottom/bottom_* modes: fraction of image height to keep from bottom (0-1)
     roi_bottom_fraction = 0.5
     # For bottom_left/bottom_right: fraction of width to keep on the chosen side (0-1)
@@ -144,16 +208,9 @@ while True:
     roi_w = 0.4  # width
     roi_h = 0.5  # height
 
-    # For polygon: list of (x,y) pairs in normalized coords (0..1)
-    roi_polygon = [(0.0, 0.6), (0.4, 0.6), (0.4, 1.0), (0.0, 1.0)]
-
     # Build ROI mask and apply to the color mask
     roi_mask = np.zeros_like(mask)  # single-channel mask same size as `mask`
-    if nav_roi_mode == "bottom":
-        roi_h_px = int(height * roi_bottom_fraction)
-        roi_top = height - roi_h_px
-        roi_mask[roi_top:, :] = 255
-    elif nav_roi_mode == "bottom_left":
+    if nav_roi_mode == "bottom_left":
         roi_h_px = int(height * roi_bottom_fraction)
         roi_w_px = int(width * roi_horizontal_fraction)
         roi_top = height - roi_h_px
@@ -173,14 +230,6 @@ while True:
             rx, ry, rw, rh = int(roi_x), int(roi_y), int(roi_w), int(roi_h)
         roi_top = ry
         roi_mask[ry : ry + rh, rx : rx + rw] = 255
-    elif nav_roi_mode == "polygon":
-        pts = np.array(
-            [[(int(x * width), int(y * height)) for (x, y) in roi_polygon]],
-            dtype=np.int32,
-        )
-        cv2.fillPoly(roi_mask, pts, 255)
-        ys = [int(y * height) for (_, y) in roi_polygon]
-        roi_top = min(ys) if ys else int(height / 2)
     else:
         # fallback: bottom half
         roi_top = int(height / 2)
@@ -191,7 +240,6 @@ while True:
 
     # Morphological operations to remove noise
     kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
     # Find contours
@@ -286,18 +334,6 @@ while True:
 
     if key == 27:  # ESC
         break
-    elif key == ord("a") or key == ord("A"):
-        nav_roi_mode = "bottom_left"
-        print(f"ROI Mode: {nav_roi_mode}")
-    elif key == ord("d") or key == ord("D"):
-        nav_roi_mode = "bottom_right"
-        print(f"ROI Mode: {nav_roi_mode}")
-    elif key == ord("s") or key == ord("S"):
-        nav_roi_mode = "custom_rect"
-        print(f"ROI Mode: {nav_roi_mode}")
-    elif key == ord("w") or key == ord("W"):
-        nav_roi_mode = "bottom"
-        print(f"ROI Mode: {nav_roi_mode}")
 
 cap.release()
 cv2.destroyAllWindows()
