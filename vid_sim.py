@@ -116,6 +116,68 @@ def process_lane_detection(frame, roi_mask):
     return combined_mask, largest_contour, centroid, error
 
 
+def detect_junction(contour, frame_height, threshold=0.7):
+    """Detect if approaching a junction (line doesn't reach bottom of frame)."""
+    if contour is None:
+        return False, None
+
+    # Get the lowest point of the contour
+    lowest_y = contour[:, :, 1].max()
+    bottom_threshold = int(frame_height * threshold)
+
+    # Check if line reaches near the bottom
+    line_reaches_bottom = lowest_y >= bottom_threshold
+
+    # Also check for multiple branches by looking at contour width at different heights
+    # Get bounding rect to estimate line width
+    x, y, w, h = cv2.boundingRect(contour)
+
+    # If line is very wide relative to its height, might be a junction
+    aspect_ratio = w / max(h, 1)
+    is_wide = aspect_ratio > 2.0  # Line spreading out
+
+    junction_detected = not line_reaches_bottom or is_wide
+
+    return junction_detected, lowest_y
+
+
+def scan_for_best_direction(frame, height, width):
+    """Scan left and right ROIs to find the best direction with more line."""
+    # Create masks for both directions
+    left_mask = create_roi_mask(height, width, "bottom_left")
+    right_mask = create_roi_mask(height, width, "bottom_right")
+
+    # Process both
+    _, left_contour, _, left_error = process_lane_detection(frame, left_mask)
+    _, right_contour, _, right_error = process_lane_detection(frame, right_mask)
+
+    # Calculate areas
+    left_area = cv2.contourArea(left_contour) if left_contour is not None else 0
+    right_area = cv2.contourArea(right_contour) if right_contour is not None else 0
+
+    # Minimum area threshold to consider a valid line
+    MIN_AREA = 500
+
+    left_valid = left_area > MIN_AREA
+    right_valid = right_area > MIN_AREA
+
+    if left_valid and right_valid:
+        # Both have lines - pick the one with more area
+        if left_area > right_area * 1.2:  # Left significantly larger
+            return "left", left_area, right_area
+        elif right_area > left_area * 1.2:  # Right significantly larger
+            return "right", left_area, right_area
+        else:
+            # Similar - default to right (or could be forward)
+            return "right", left_area, right_area
+    elif left_valid:
+        return "left", left_area, right_area
+    elif right_valid:
+        return "right", left_area, right_area
+    else:
+        return None, left_area, right_area
+
+
 def pid_follow_line(error):
     """Calculate steering based on error (P-Controller)."""
     if error is None:
@@ -162,7 +224,14 @@ def main():
         "stop_start_time": 0,
         "last_stop_time": 0,
         "pending_roi_mode": None,
+        "lost_line_time": None,
+        "search_direction": None,
+        "junction_detected_time": None,
     }
+
+    LOST_LINE_TIMEOUT = 0.5  # Seconds before starting search
+    SEARCH_TIMEOUT = 2.0  # Seconds to search each direction
+    JUNCTION_CONFIRM_TIME = 0.3  # Seconds to confirm junction before acting
 
     print("Video Controls:\n  ESC - Exit\n")
 
@@ -242,20 +311,145 @@ def main():
                     print(f"Wait done. ROI: {state['roi_mode']}")
                 state["pending_roi_mode"] = None
 
+        elif state["fsm"] == "TURN_180":
+            TURN_DURATION = 3.0  # Adjust based on robot turn speed
+            elapsed = time.time() - state["turn_start_time"]
+            remaining = int(TURN_DURATION - elapsed) + 1
+            cv2.putText(
+                frame,
+                f"TURN 180: {remaining}s",
+                (width // 2 - 150, height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                2,
+                (255, 165, 0),
+                4,
+            )
+
+            if elapsed >= TURN_DURATION:
+                state["fsm"] = "FOLLOW_LANE"
+                state["roi_mode"] = "custom_rect"
+                state["lost_line_time"] = None
+                state["search_direction"] = None
+                print("Turn complete. Resuming lane follow.")
+
         # 3. Lane Detection
         roi_mask = create_roi_mask(height, width, state["roi_mode"])
         processed_mask, contour, centroid, error = process_lane_detection(
             frame, roi_mask
         )
 
-        # 4. Auto-switch ROI based on error
+        # 4. Junction detection & Auto-switch ROI
+        junction_detected, lowest_y = detect_junction(contour, height)
+
         if error is not None:
-            if state["roi_mode"] == "bottom_left" and -30 <= error <= 0:
-                state["roi_mode"] = "custom_rect"
-                print("Auto-switch -> custom_rect")
-            elif state["roi_mode"] == "bottom_right" and 0 <= error <= 30:
-                state["roi_mode"] = "custom_rect"
-                print("Auto-switch -> custom_rect")
+            # Line found - reset lost state
+            state["lost_line_time"] = None
+
+            # Check for junction while still seeing the line
+            if (
+                junction_detected
+                and state["roi_mode"] == "custom_rect"
+                and state["fsm"] == "FOLLOW_LANE"
+            ):
+                if state["junction_detected_time"] is None:
+                    state["junction_detected_time"] = time.time()
+
+                junction_duration = time.time() - state["junction_detected_time"]
+
+                # Visualize junction warning
+                cv2.putText(
+                    frame,
+                    "JUNCTION AHEAD",
+                    (width // 2 - 120, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 255),
+                    2,
+                )
+
+                if (
+                    junction_duration > JUNCTION_CONFIRM_TIME
+                    and state["search_direction"] is None
+                ):
+                    # Scan both directions to find the best one
+                    best_dir, left_area, right_area = scan_for_best_direction(
+                        frame, height, width
+                    )
+                    print(
+                        f"Junction scan - Left: {left_area}, Right: {right_area}, Best: {best_dir}"
+                    )
+
+                    if best_dir == "left":
+                        state["search_direction"] = "left"
+                        state["roi_mode"] = "bottom_left"
+                        print("Junction detected. Going LEFT (more line found)")
+                    elif best_dir == "right":
+                        state["search_direction"] = "right"
+                        state["roi_mode"] = "bottom_right"
+                        print("Junction detected. Going RIGHT (more line found)")
+                    else:
+                        # No good direction found, start search sequence
+                        state["search_direction"] = "right"
+                        state["roi_mode"] = "bottom_right"
+                        state["search_start_time"] = time.time()
+                        print("Junction detected. No clear direction, searching...")
+            else:
+                # No junction or already handling it
+                if state["search_direction"] is None:
+                    state["junction_detected_time"] = None
+
+                if state["roi_mode"] == "bottom_left" and -30 <= error <= 0:
+                    state["roi_mode"] = "custom_rect"
+                    state["search_direction"] = None
+                    state["junction_detected_time"] = None
+                    print("Auto-switch -> custom_rect")
+                elif state["roi_mode"] == "bottom_right" and 0 <= error <= 30:
+                    state["roi_mode"] = "custom_rect"
+                    state["search_direction"] = None
+                    state["junction_detected_time"] = None
+                    print("Auto-switch -> custom_rect")
+        else:
+            # Line lost - search logic
+            if state["roi_mode"] == "custom_rect" and state["fsm"] == "FOLLOW_LANE":
+                if state["lost_line_time"] is None:
+                    state["lost_line_time"] = time.time()
+
+                lost_duration = time.time() - state["lost_line_time"]
+
+                if lost_duration > LOST_LINE_TIMEOUT:
+                    if state["search_direction"] is None:
+                        # Start searching right first
+                        state["search_direction"] = "right"
+                        state["roi_mode"] = "bottom_right"
+                        state["search_start_time"] = time.time()
+                        print("Line lost. Searching RIGHT...")
+
+            elif (
+                state["roi_mode"] == "bottom_right"
+                and state["search_direction"] == "right"
+            ):
+                search_elapsed = time.time() - state.get(
+                    "search_start_time", time.time()
+                )
+                if search_elapsed > SEARCH_TIMEOUT:
+                    # Switch to left search
+                    state["search_direction"] = "left"
+                    state["roi_mode"] = "bottom_left"
+                    state["search_start_time"] = time.time()
+                    print("Not found right. Searching LEFT...")
+
+            elif (
+                state["roi_mode"] == "bottom_left"
+                and state["search_direction"] == "left"
+            ):
+                search_elapsed = time.time() - state.get(
+                    "search_start_time", time.time()
+                )
+                if search_elapsed > SEARCH_TIMEOUT:
+                    # Turn 180 degrees
+                    state["fsm"] = "TURN_180"
+                    state["turn_start_time"] = time.time()
+                    print("Line not found. Turning 180...")
 
         # 5. Visualization
         # Draw ROI
