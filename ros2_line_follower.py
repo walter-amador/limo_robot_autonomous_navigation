@@ -42,7 +42,7 @@ class LineFollowerNode(Node):
         self.WAIT_DURATION = 3.0
         self.LOST_LINE_TIMEOUT = 0.5
         self.SEARCH_TIMEOUT = 2.0
-        self.JUNCTION_CONFIRM_TIME = 0.8  # Wait before confirming junction
+        self.JUNCTION_CONFIRM_TIME = 0.7  # Wait before confirming junction
         self.TURN_180_DURATION = 3.0
 
         # Robot control parameters
@@ -50,6 +50,11 @@ class LineFollowerNode(Node):
         self.LINEAR_SPEED_SLOW = 0.05  # m/s - slow speed for junctions
         self.ANGULAR_SPEED = 0.3  # rad/s - base turning speed
         self.KP = 0.003  # Proportional gain for steering
+        self.KD = 0.001  # Derivative gain for damping oscillations
+
+        # PID state variables
+        self.previous_error = 0.0
+        self.last_error_time = None
 
         # Display window option
         self.show_visualization = True
@@ -73,6 +78,8 @@ class LineFollowerNode(Node):
             "turn_start_time": 0,
             "search_start_time": 0,
             "junction_deciding": False,  # True while scanning/deciding at junction
+            "sign_directed": False,  # True when a sign has set the direction (priority over junction)
+            "sign_directed_time": None,  # Time when sign direction was set (for timeout)
         }
 
         # Current error for control
@@ -173,8 +180,8 @@ class LineFollowerNode(Node):
             mask[height - h :, width - w :] = 255
         elif mode == "custom_rect":
             # Start ROI higher to detect junctions earlier
-            rx, ry = int(0.3 * width), int(0.35 * height)
-            rw, rh = int(0.4 * width), int(0.65 * height)
+            rx, ry = int(0.25 * width), int(0.35 * height)
+            rw, rh = int(0.5 * width), int(0.65 * height)
             mask[ry : ry + rh, rx : rx + rw] = 255
         else:
             h = int(height * 0.5)
@@ -262,10 +269,31 @@ class LineFollowerNode(Node):
             return None, left_area, right_area
 
     def pid_follow_line(self, error):
-        """Calculate angular velocity based on error (P-Controller)."""
+        """Calculate angular velocity based on error (PD-Controller)."""
         if error is None:
+            # Reset derivative state when line is lost
+            self.previous_error = 0.0
+            self.last_error_time = None
             return 0.0
-        return -self.KP * error
+        
+        current_time = time.time()
+        
+        # Proportional term
+        p_term = -self.KP * error
+        
+        # Derivative term
+        d_term = 0.0
+        if self.last_error_time is not None:
+            dt = current_time - self.last_error_time
+            if dt > 0:
+                error_derivative = (error - self.previous_error) / dt
+                d_term = -self.KD * error_derivative
+        
+        # Update state for next iteration
+        self.previous_error = error
+        self.last_error_time = current_time
+        
+        return p_term + d_term
 
     def image_callback(self, msg):
         """Process incoming camera images"""
@@ -281,8 +309,8 @@ class LineFollowerNode(Node):
             frame, detections = self.detect_and_annotate_signs(frame)
 
             # 2. Draw sign detection ROI lines
-            sign_roi_top = int(height * 0.75)
-            sign_roi_bottom = int(height * 0.8)
+            sign_roi_top = int(height * 0.65)
+            sign_roi_bottom = int(height * 0.7)
             cv2.line(frame, (0, sign_roi_top), (width, sign_roi_top), (0, 0, 255), 2)
             cv2.line(
                 frame, (0, sign_roi_bottom), (width, sign_roi_bottom), (0, 0, 255), 2
@@ -385,12 +413,21 @@ class LineFollowerNode(Node):
             if stop_detected:
                 self.state["fsm"] = "STOP_WAIT"
                 self.state["stop_start_time"] = time.time()
+                # Signs have priority - disable junction auto-detection
+                self.state["junction_deciding"] = False
+                self.state["junction_detected_time"] = None
                 if direction_detected == "left":
                     self.state["pending_roi_mode"] = "bottom_left"
+                    self.state["sign_directed"] = True
+                    self.state["sign_directed_time"] = time.time()
                 elif direction_detected == "right":
                     self.state["pending_roi_mode"] = "bottom_right"
+                    self.state["sign_directed"] = True
+                    self.state["sign_directed_time"] = time.time()
                 elif direction_detected == "forward":
                     self.state["pending_roi_mode"] = "custom_rect"
+                    self.state["sign_directed"] = True
+                    self.state["sign_directed_time"] = time.time()
                 else:
                     self.state["pending_roi_mode"] = None
                 self.get_logger().warn(
@@ -398,6 +435,11 @@ class LineFollowerNode(Node):
                 )
 
             elif direction_detected:
+                # Signs have priority - disable junction auto-detection
+                self.state["sign_directed"] = True
+                self.state["sign_directed_time"] = time.time()
+                self.state["junction_deciding"] = False
+                self.state["junction_detected_time"] = None
                 if direction_detected == "left":
                     self.state["roi_mode"] = "bottom_left"
                 elif direction_detected == "right":
@@ -405,7 +447,7 @@ class LineFollowerNode(Node):
                 elif direction_detected == "forward":
                     self.state["roi_mode"] = "custom_rect"
                 self.get_logger().info(
-                    f"Sign: {direction_detected} -> ROI: {self.state['roi_mode']}"
+                    f"Sign: {direction_detected} -> ROI: {self.state['roi_mode']} (sign priority)"
                 )
 
         elif self.state["fsm"] == "STOP_WAIT":
@@ -447,6 +489,11 @@ class LineFollowerNode(Node):
                 self.state["roi_mode"] = "custom_rect"
                 self.state["lost_line_time"] = None
                 self.state["search_direction"] = None
+                self.state["sign_directed"] = False  # Reset sign priority
+                self.state["sign_directed_time"] = None
+                # Reset PID state after turn
+                self.previous_error = 0.0
+                self.last_error_time = None
                 self.get_logger().info("Turn complete. Resuming lane follow.")
 
     def process_junction_logic(self, frame, contour, error, height, width):
@@ -456,10 +503,12 @@ class LineFollowerNode(Node):
         if error is not None:
             self.state["lost_line_time"] = None
 
+            # Only do automatic junction detection if signs haven't already set direction
             if (
                 junction_detected
                 and self.state["roi_mode"] == "custom_rect"
                 and self.state["fsm"] == "FOLLOW_LANE"
+                and not self.state["sign_directed"]  # Signs have priority
             ):
 
                 if self.state["junction_detected_time"] is None:
@@ -499,22 +548,57 @@ class LineFollowerNode(Node):
                         self.state["roi_mode"] = "bottom_right"
                         self.state["search_start_time"] = time.time()
             else:
+                # No junction detected or not in custom_rect mode
                 if self.state["search_direction"] is None:
                     self.state["junction_detected_time"] = None
+                    # Reset junction_deciding if no junction and no active search
+                    if not junction_detected:
+                        self.state["junction_deciding"] = False
 
-                if self.state["roi_mode"] == "bottom_left" and -30 <= error <= 0:
-                    self.state["roi_mode"] = "custom_rect"
-                    self.state["search_direction"] = None
-                    self.state["junction_detected_time"] = None
-                    self.state["junction_deciding"] = False  # Resume normal speed
-                elif self.state["roi_mode"] == "bottom_right" and 0 <= error <= 30:
-                    self.state["roi_mode"] = "custom_rect"
-                    self.state["search_direction"] = None
-                    self.state["junction_detected_time"] = None
-                    self.state["junction_deciding"] = False  # Resume normal speed
+                # Check if we've completed the turn and can return to normal following
+                if self.state["roi_mode"] == "bottom_left":
+                    if -50 <= error <= 10:  # Wider tolerance for resuming
+                        self.state["roi_mode"] = "custom_rect"
+                        self.state["search_direction"] = None
+                        self.state["junction_detected_time"] = None
+                        self.state["junction_deciding"] = False  # Resume normal speed
+                        self.state["sign_directed"] = False  # Reset sign priority
+                        self.state["sign_directed_time"] = None
+                        self.get_logger().info("Left turn complete, resuming normal speed")
+                elif self.state["roi_mode"] == "bottom_right":
+                    if -10 <= error <= 50:  # Wider tolerance for resuming
+                        self.state["roi_mode"] = "custom_rect"
+                        self.state["search_direction"] = None
+                        self.state["junction_detected_time"] = None
+                        self.state["junction_deciding"] = False  # Resume normal speed
+                        self.state["sign_directed"] = False  # Reset sign priority
+                        self.state["sign_directed_time"] = None
+                        self.get_logger().info("Right turn complete, resuming normal speed")
         else:
-            # Line lost - search logic
-            if (
+            # Line lost - handle sign-directed turns or search logic
+            if self.state["sign_directed"] and self.state["fsm"] == "FOLLOW_LANE":
+                # Sign directed a turn but line is lost - keep turning
+                # But add a timeout to prevent infinite turning
+                if self.state["sign_directed_time"] is not None:
+                    sign_turn_duration = time.time() - self.state["sign_directed_time"]
+                    # If we've been turning for too long (e.g., 5 seconds), give up and search
+                    if sign_turn_duration > 5.0:
+                        self.get_logger().warn("Sign-directed turn timeout, switching to search mode")
+                        self.state["sign_directed"] = False
+                        self.state["sign_directed_time"] = None
+                        self.state["search_direction"] = "left" if self.state["roi_mode"] == "bottom_left" else "right"
+                        self.state["search_start_time"] = time.time()
+                # Display that we're still turning based on sign
+                cv2.putText(
+                    frame,
+                    "SIGN TURN - SEARCHING",
+                    (width // 2 - 140, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                )
+            elif (
                 self.state["roi_mode"] == "custom_rect"
                 and self.state["fsm"] == "FOLLOW_LANE"
             ):
@@ -674,9 +758,9 @@ class LineFollowerNode(Node):
 
         elif self.state["fsm"] == "FOLLOW_LANE":
             if self.current_error is not None:
-                # Follow line using P-controller
-                # Slow down if deciding at junction
-                if self.state["junction_deciding"]:
+                # Follow line using PD-controller
+                # Slow down if deciding at junction OR if sign directed a turn
+                if self.state["junction_deciding"] or self.state["sign_directed"]:
                     twist.linear.x = self.LINEAR_SPEED_SLOW
                 else:
                     twist.linear.x = self.LINEAR_SPEED
@@ -687,8 +771,18 @@ class LineFollowerNode(Node):
                 max_angular = 0.8
                 twist.angular.z = max(-max_angular, min(max_angular, twist.angular.z))
             else:
-                # Line lost - slow rotation to search
-                if self.state["search_direction"] == "left":
+                # Line lost - continue turning based on sign direction or search
+                if self.state["sign_directed"]:
+                    # Sign directed a turn - keep turning in that direction with slow forward motion
+                    twist.linear.x = self.LINEAR_SPEED_SLOW * 0.5  # Very slow forward
+                    if self.state["roi_mode"] == "bottom_left":
+                        twist.angular.z = self.ANGULAR_SPEED * 0.7  # Turn left
+                    elif self.state["roi_mode"] == "bottom_right":
+                        twist.angular.z = -self.ANGULAR_SPEED * 0.7  # Turn right
+                    else:
+                        twist.linear.x = 0.0
+                        twist.angular.z = 0.0
+                elif self.state["search_direction"] == "left":
                     twist.linear.x = 0.0
                     twist.angular.z = self.ANGULAR_SPEED * 0.5
                 elif self.state["search_direction"] == "right":
