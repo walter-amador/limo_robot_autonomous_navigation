@@ -42,11 +42,12 @@ class LineFollowerNode(Node):
         self.WAIT_DURATION = 3.0
         self.LOST_LINE_TIMEOUT = 0.5
         self.SEARCH_TIMEOUT = 2.0
-        self.JUNCTION_CONFIRM_TIME = 0.01
+        self.JUNCTION_CONFIRM_TIME = 0.8  # Wait before confirming junction
         self.TURN_180_DURATION = 3.0
 
         # Robot control parameters
-        self.LINEAR_SPEED = 0.1  # m/s - forward speed
+        self.LINEAR_SPEED = 0.15  # m/s - forward speed
+        self.LINEAR_SPEED_SLOW = 0.05  # m/s - slow speed for junctions
         self.ANGULAR_SPEED = 0.3  # rad/s - base turning speed
         self.KP = 0.003  # Proportional gain for steering
 
@@ -71,6 +72,7 @@ class LineFollowerNode(Node):
             "junction_detected_time": None,
             "turn_start_time": 0,
             "search_start_time": 0,
+            "junction_deciding": False,  # True while scanning/deciding at junction
         }
 
         # Current error for control
@@ -96,7 +98,7 @@ class LineFollowerNode(Node):
 
         # Subscriber for camera images
         self.image_sub = self.create_subscription(
-            Image, "/camera/color/image_raw", self.image_callback, qos_profile
+            Image, "/camera/image_raw", self.image_callback, qos_profile
         )
 
         # Publisher for status messages
@@ -170,8 +172,9 @@ class LineFollowerNode(Node):
             w = int(width * 0.5)
             mask[height - h :, width - w :] = 255
         elif mode == "custom_rect":
-            rx, ry = int(0.3 * width), int(0.5 * height)
-            rw, rh = int(0.4 * width), int(0.5 * height)
+            # Start ROI higher to detect junctions earlier
+            rx, ry = int(0.3 * width), int(0.35 * height)
+            rw, rh = int(0.4 * width), int(0.65 * height)
             mask[ry : ry + rh, rx : rx + rw] = 255
         else:
             h = int(height * 0.5)
@@ -210,7 +213,7 @@ class LineFollowerNode(Node):
         return combined_mask, largest_contour, centroid, error
 
     def detect_junction(self, contour, frame_height, threshold=0.3):
-        """Detect if approaching a junction."""
+        """Detect if approaching a junction (line doesn't reach bottom of ROI)."""
         if contour is None:
             return False, None
 
@@ -218,9 +221,12 @@ class LineFollowerNode(Node):
         bottom_threshold = int(frame_height * threshold)
         line_reaches_bottom = lowest_y >= bottom_threshold
 
+        print('+++line_reaches_bottom', line_reaches_bottom)
+
         x, y, w, h = cv2.boundingRect(contour)
         aspect_ratio = w / max(h, 1)
-        is_wide = aspect_ratio > 2.0
+        is_wide = aspect_ratio > 1.5
+        print('+++is_wide', is_wide)
 
         junction_detected = not line_reaches_bottom or is_wide
         return junction_detected, lowest_y
@@ -458,12 +464,13 @@ class LineFollowerNode(Node):
 
                 if self.state["junction_detected_time"] is None:
                     self.state["junction_detected_time"] = time.time()
+                    self.state["junction_deciding"] = True  # Start slowing down
 
                 junction_duration = time.time() - self.state["junction_detected_time"]
                 cv2.putText(
                     frame,
-                    "JUNCTION AHEAD",
-                    (width // 2 - 120, 120),
+                    "JUNCTION - SLOWING",
+                    (width // 2 - 140, 120),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,
                     (0, 255, 255),
@@ -499,10 +506,12 @@ class LineFollowerNode(Node):
                     self.state["roi_mode"] = "custom_rect"
                     self.state["search_direction"] = None
                     self.state["junction_detected_time"] = None
+                    self.state["junction_deciding"] = False  # Resume normal speed
                 elif self.state["roi_mode"] == "bottom_right" and 0 <= error <= 30:
                     self.state["roi_mode"] = "custom_rect"
                     self.state["search_direction"] = None
                     self.state["junction_detected_time"] = None
+                    self.state["junction_deciding"] = False  # Resume normal speed
         else:
             # Line lost - search logic
             if (
@@ -551,6 +560,44 @@ class LineFollowerNode(Node):
             roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         cv2.drawContours(frame, roi_contours, -1, (255, 255, 0), 2)
+
+        # Draw junction detection threshold line (cyan dashed effect)
+        junction_threshold = 0.4  # Same as detect_junction threshold
+        junction_y = int(height * junction_threshold)
+        # Draw the line where junction is detected (if line ends ABOVE this = junction)
+        cv2.line(frame, (0, junction_y), (width, junction_y), (255, 255, 0), 2)
+        cv2.putText(
+            frame,
+            "JUNCTION THRESHOLD",
+            (width // 2 - 100, junction_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 0),
+            1,
+        )
+        cv2.putText(
+            frame,
+            "(line must reach below this)",
+            (width // 2 - 110, junction_y + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (255, 255, 0),
+            1,
+        )
+
+        # Draw where the line currently ends (if contour exists)
+        if contour is not None:
+            lowest_y = contour[:, :, 1].max()
+            cv2.line(frame, (0, lowest_y), (width, lowest_y), (0, 165, 255), 2)
+            cv2.putText(
+                frame,
+                f"LINE END: y={lowest_y}",
+                (10, lowest_y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 165, 255),
+                1,
+            )
 
         if contour is not None:
             cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
@@ -628,7 +675,12 @@ class LineFollowerNode(Node):
         elif self.state["fsm"] == "FOLLOW_LANE":
             if self.current_error is not None:
                 # Follow line using P-controller
-                twist.linear.x = self.LINEAR_SPEED
+                # Slow down if deciding at junction
+                if self.state["junction_deciding"]:
+                    twist.linear.x = self.LINEAR_SPEED_SLOW
+                else:
+                    twist.linear.x = self.LINEAR_SPEED
+                
                 twist.angular.z = self.pid_follow_line(self.current_error)
 
                 # Limit angular velocity
