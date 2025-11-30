@@ -227,6 +227,11 @@ def main():
         "lost_line_time": None,
         "search_direction": None,
         "junction_detected_time": None,
+        "turn_start_time": 0,
+        "search_start_time": 0,
+        "junction_deciding": False,  # True while scanning/deciding at junction
+        "sign_directed": False,  # True when a sign has set the direction (priority over junction)
+        "sign_directed_time": None,  # Time when sign direction was set (for timeout)
     }
 
     LOST_LINE_TIMEOUT = 0.5  # Seconds before starting search
@@ -271,24 +276,38 @@ def main():
             if stop_detected:
                 state["fsm"] = "STOP_WAIT"
                 state["stop_start_time"] = time.time()
+                # Signs have priority - disable junction auto-detection
+                state["junction_deciding"] = False
+                state["junction_detected_time"] = None
                 if direction_detected == "left":
                     state["pending_roi_mode"] = "bottom_left"
+                    state["sign_directed"] = True
+                    state["sign_directed_time"] = time.time()
                 elif direction_detected == "right":
                     state["pending_roi_mode"] = "bottom_right"
+                    state["sign_directed"] = True
+                    state["sign_directed_time"] = time.time()
                 elif direction_detected == "forward":
                     state["pending_roi_mode"] = "custom_rect"
+                    state["sign_directed"] = True
+                    state["sign_directed_time"] = time.time()
                 else:
                     state["pending_roi_mode"] = None
                 print(f"STOP DETECTED. Waiting... Pending: {state['pending_roi_mode']}")
 
             elif direction_detected:
+                # Signs have priority - disable junction auto-detection
+                state["sign_directed"] = True
+                state["sign_directed_time"] = time.time()
+                state["junction_deciding"] = False
+                state["junction_detected_time"] = None
                 if direction_detected == "left":
                     state["roi_mode"] = "bottom_left"
                 elif direction_detected == "right":
                     state["roi_mode"] = "bottom_right"
                 elif direction_detected == "forward":
                     state["roi_mode"] = "custom_rect"
-                print(f"Sign: {direction_detected} -> ROI: {state['roi_mode']}")
+                print(f"Sign: {direction_detected} -> ROI: {state['roi_mode']} (sign priority)")
 
         elif state["fsm"] == "STOP_WAIT":
             elapsed = time.time() - state["stop_start_time"]
@@ -330,6 +349,10 @@ def main():
                 state["roi_mode"] = "custom_rect"
                 state["lost_line_time"] = None
                 state["search_direction"] = None
+                state["sign_directed"] = False  # Reset sign priority
+                state["sign_directed_time"] = None
+                # Reset any deciding flags
+                state["junction_deciding"] = False
                 print("Turn complete. Resuming lane follow.")
 
         # 3. Lane Detection
@@ -345,21 +368,22 @@ def main():
             # Line found - reset lost state
             state["lost_line_time"] = None
 
-            # Check for junction while still seeing the line
+            # Only do automatic junction detection if signs haven't already set direction
             if (
                 junction_detected
                 and state["roi_mode"] == "custom_rect"
                 and state["fsm"] == "FOLLOW_LANE"
+                and not state["sign_directed"]  # Signs have priority
             ):
+
                 if state["junction_detected_time"] is None:
                     state["junction_detected_time"] = time.time()
+                    state["junction_deciding"] = True  # Start slowing down
 
                 junction_duration = time.time() - state["junction_detected_time"]
-
-                # Visualize junction warning
                 cv2.putText(
                     frame,
-                    "JUNCTION AHEAD",
+                    "JUNCTION - SLOWING",
                     (width // 2 - 120, 120),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,
@@ -371,7 +395,6 @@ def main():
                     junction_duration > JUNCTION_CONFIRM_TIME
                     and state["search_direction"] is None
                 ):
-                    # Scan both directions to find the best one
                     best_dir, left_area, right_area = scan_for_best_direction(
                         frame, height, width
                     )
@@ -388,26 +411,37 @@ def main():
                         state["roi_mode"] = "bottom_right"
                         print("Junction detected. Going RIGHT (more line found)")
                     else:
-                        # No good direction found, start search sequence
                         state["search_direction"] = "right"
                         state["roi_mode"] = "bottom_right"
                         state["search_start_time"] = time.time()
                         print("Junction detected. No clear direction, searching...")
             else:
-                # No junction or already handling it
+                # No junction detected or not in custom_rect mode
                 if state["search_direction"] is None:
                     state["junction_detected_time"] = None
+                    # Reset junction_deciding if no junction and no active search
+                    if not junction_detected:
+                        state["junction_deciding"] = False
 
-                if state["roi_mode"] == "bottom_left" and -30 <= error <= 0:
-                    state["roi_mode"] = "custom_rect"
-                    state["search_direction"] = None
-                    state["junction_detected_time"] = None
-                    print("Auto-switch -> custom_rect")
-                elif state["roi_mode"] == "bottom_right" and 0 <= error <= 30:
-                    state["roi_mode"] = "custom_rect"
-                    state["search_direction"] = None
-                    state["junction_detected_time"] = None
-                    print("Auto-switch -> custom_rect")
+                # Check if we've completed the turn and can return to normal following
+                if state["roi_mode"] == "bottom_left":
+                    if -50 <= error <= 10:  # Wider tolerance for resuming
+                        state["roi_mode"] = "custom_rect"
+                        state["search_direction"] = None
+                        state["junction_detected_time"] = None
+                        state["junction_deciding"] = False  # Resume normal speed
+                        state["sign_directed"] = False  # Reset sign priority
+                        state["sign_directed_time"] = None
+                        print("Left turn complete, resuming normal speed")
+                elif state["roi_mode"] == "bottom_right":
+                    if -10 <= error <= 50:  # Wider tolerance for resuming
+                        state["roi_mode"] = "custom_rect"
+                        state["search_direction"] = None
+                        state["junction_detected_time"] = None
+                        state["junction_deciding"] = False  # Resume normal speed
+                        state["sign_directed"] = False  # Reset sign priority
+                        state["sign_directed_time"] = None
+                        print("Right turn complete, resuming normal speed")
         else:
             # Line lost - search logic
             if state["roi_mode"] == "custom_rect" and state["fsm"] == "FOLLOW_LANE":
@@ -458,10 +492,47 @@ def main():
         )
         cv2.drawContours(frame, roi_contours, -1, (255, 255, 0), 2)
 
+        # Draw junction detection threshold line (cyan)
+        junction_threshold = 0.4
+        junction_y = int(height * junction_threshold)
+        cv2.line(frame, (0, junction_y), (width, junction_y), (255, 255, 0), 2)
+        cv2.putText(
+            frame,
+            "JUNCTION THRESHOLD",
+            (width // 2 - 100, junction_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 0),
+            1,
+        )
+        cv2.putText(
+            frame,
+            "(line must reach below this)",
+            (width // 2 - 110, junction_y + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (255, 255, 0),
+            1,
+        )
+
         if contour is not None:
             cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
             cv2.circle(frame, centroid, 5, (0, 0, 255), -1)
             cv2.line(frame, (width // 2, 0), (width // 2, height), (255, 0, 0), 1)
+
+            # Draw where the line currently ends (if contour exists)
+            lowest_y = contour[:, :, 1].max()
+            cv2.line(frame, (0, lowest_y), (width, lowest_y), (0, 165, 255), 2)
+            cv2.putText(
+                frame,
+                f"LINE END: y={lowest_y}",
+                (10, lowest_y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 165, 255),
+                1,
+            )
+
             visualize_control(frame, error, height, width)
 
         cv2.imshow("Processed Mask", processed_mask)
