@@ -42,7 +42,7 @@ class ObstacleDetectionNode(Node):
         self.LANE_UPPER_HSV = np.array([85, 250, 255])
 
         # Obstacle detection parameters
-        self.OBSTACLE_MIN_AREA = 25  # Minimum contour area to consider as obstacle
+        self.OBSTACLE_MIN_AREA = 250  # Minimum contour area to consider as obstacle
         self.OBSTACLE_DANGER_ZONE_Y = 0.70  # Bottom 30% of frame is danger zone
         self.OBSTACLE_WARNING_ZONE_Y = 0.50  # Bottom 50% is warning zone
 
@@ -77,7 +77,17 @@ class ObstacleDetectionNode(Node):
         self.avoidance_direction = None  # 'left' or 'right' (direction to turn)
         self.obstacle_side = None  # 'left' or 'right' (side where obstacle is)
         self.phase_start_time = None  # Track when current phase started
-        self.PHASE_TIMEOUT = 2.0  # Maximum seconds to spend in any phase
+        self.phase1_alignment_achieved = (
+            False  # Track if Phase 1 corner alignment is done
+        )
+        self.phase1_restart_count = (
+            0  # Count how many times Phase 1 restarts due to obstacle
+        )
+        self.PHASE1_MAX_RESTARTS = (
+            10  # After this many restarts, force turn until obstacle clears
+        )
+        self.PHASE_TIMEOUT_TURN = 3.0  # Maximum seconds for turning phases (1 and 3)
+        self.PHASE_TIMEOUT_FORWARD = 2.0  # Maximum seconds for forward phase (2)
 
         # FPS tracking
         self.last_fps_update = time.time()
@@ -692,39 +702,82 @@ class ObstacleDetectionNode(Node):
                 # Start new avoidance maneuver
                 self.avoidance_active = True
                 self.avoidance_phase = 1
+                self.phase1_alignment_achieved = False  # Reset alignment flag
                 self.phase_start_time = time.time()  # Start Phase 1 timer
-                self.get_logger().info(
-                    f"Avoidance started: obstacle on {self.obstacle_side}, turning {self.avoidance_direction}"
-                )
+
+                if self.phase1_restart_count > self.PHASE1_MAX_RESTARTS:
+                    # Already in forced turn mode from previous alignment loops
+                    self.phase1_alignment_achieved = (
+                        True  # Skip alignment, go straight to turn mode
+                    )
+                    self.get_logger().info(
+                        f"Avoidance started: FORCED TURN MODE - turning {self.avoidance_direction} until obstacle clears"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"Avoidance started: obstacle on {self.obstacle_side}, turning {self.avoidance_direction}"
+                    )
+            elif self.avoidance_phase == 1:
+                # In Phase 1 with obstacle still visible
+                # Check if corner alignment is achieved (only if not already in forced turn mode)
+                if not self.phase1_alignment_achieved:
+                    error = self.calculate_avoidance_error(height, width)
+                    if error is not None and abs(error) < 20:
+                        # Alignment achieved but obstacle still visible
+                        self.phase1_restart_count += 1  # Count this as a "loop"
+
+                        if self.phase1_restart_count > self.PHASE1_MAX_RESTARTS:
+                            # Too many alignment completions with obstacle still there
+                            self.phase1_alignment_achieved = (
+                                True  # Switch to forced turn mode
+                            )
+                            self.get_logger().info(
+                                f"Phase 1: Alignment loop #{self.phase1_restart_count} - FORCED TURN MODE - turning {self.avoidance_direction} until obstacle clears"
+                            )
+                        else:
+                            self.get_logger().info(
+                                f"Phase 1: Alignment achieved but obstacle still visible (loop #{self.phase1_restart_count}/{self.PHASE1_MAX_RESTARTS})"
+                            )
+                # Keep turning until obstacle clears (handled by else branch below)
         else:
             # No active obstacle - check phase transitions and completion
             if self.avoidance_active:
                 error = self.calculate_avoidance_error(height, width)
 
                 if self.avoidance_phase == 1:
-                    # Check if Phase 1 is complete (top corner near lane edge OR timeout)
-                    phase1_elapsed = (
-                        time.time() - self.phase_start_time
-                        if self.phase_start_time
-                        else 0
-                    )
-                    phase1_complete = (error is not None and abs(error) < 20) or (
-                        phase1_elapsed >= self.PHASE_TIMEOUT
-                    )
-
-                    if phase1_complete:
+                    # Phase 1: Check completion condition
+                    if self.phase1_alignment_achieved:
+                        # In forced turn mode - obstacle cleared, go to Phase 2 (ignore alignment)
                         self.avoidance_phase = 2
+                        self.phase1_alignment_achieved = (
+                            False  # Reset for next avoidance
+                        )
+                        self.phase1_restart_count = (
+                            0  # Reset restart counter on successful transition
+                        )
                         self.phase_start_time = time.time()  # Start Phase 2 timer
                         self.previous_avoidance_error = 0.0
                         self.last_avoidance_error_time = None
-                        if phase1_elapsed >= self.PHASE_TIMEOUT:
-                            self.get_logger().info(
-                                f"Phase 1 timeout ({self.PHASE_TIMEOUT}s): Moving to Phase 2"
+                        self.get_logger().info(
+                            "Phase 1 complete: Forced turn mode - obstacle cleared, moving forward"
+                        )
+                    else:
+                        # Normal mode - must achieve alignment before transitioning
+                        alignment_complete = error is not None and abs(error) < 20
+
+                        if alignment_complete:
+                            # Alignment achieved and obstacle cleared - transition to Phase 2
+                            self.avoidance_phase = 2
+                            self.phase1_restart_count = (
+                                0  # Reset restart counter on successful transition
                             )
-                        else:
+                            self.phase_start_time = time.time()  # Start Phase 2 timer
+                            self.previous_avoidance_error = 0.0
+                            self.last_avoidance_error_time = None
                             self.get_logger().info(
-                                "Phase 1 complete: Turn done, moving forward"
+                                "Phase 1 complete: Alignment done and obstacle cleared, moving forward"
                             )
+                        # else: Keep turning until alignment is achieved (PD controller will handle it)
 
                 elif self.avoidance_phase == 2:
                     # Check if Phase 2 is complete (bottom corner near lane edge OR timeout)
@@ -734,7 +787,7 @@ class ObstacleDetectionNode(Node):
                         else 0
                     )
                     phase2_complete = (error is not None and abs(error) < 20) or (
-                        phase2_elapsed >= self.PHASE_TIMEOUT
+                        phase2_elapsed >= self.PHASE_TIMEOUT_FORWARD
                     )
 
                     if phase2_complete:
@@ -742,9 +795,9 @@ class ObstacleDetectionNode(Node):
                         self.phase_start_time = time.time()  # Start Phase 3 timer
                         self.previous_avoidance_error = 0.0
                         self.last_avoidance_error_time = None
-                        if phase2_elapsed >= self.PHASE_TIMEOUT:
+                        if phase2_elapsed >= self.PHASE_TIMEOUT_FORWARD:
                             self.get_logger().info(
-                                f"Phase 2 timeout ({self.PHASE_TIMEOUT}s): Moving to Phase 3"
+                                f"Phase 2 timeout ({self.PHASE_TIMEOUT_FORWARD}s): Moving to Phase 3"
                             )
                         else:
                             self.get_logger().info(
@@ -761,7 +814,7 @@ class ObstacleDetectionNode(Node):
                     # Check error tolerance first
                     error_satisfied = error is not None and abs(error) < 50
                     # Check timeout as fallback
-                    timeout_triggered = phase3_elapsed >= self.PHASE_TIMEOUT
+                    timeout_triggered = phase3_elapsed >= self.PHASE_TIMEOUT_TURN
 
                     phase3_complete = error_satisfied or timeout_triggered
 
@@ -775,7 +828,7 @@ class ObstacleDetectionNode(Node):
                         self.last_avoidance_error_time = None
                         if timeout_triggered and not error_satisfied:
                             self.get_logger().info(
-                                f"Phase 3 timeout ({self.PHASE_TIMEOUT}s): Resuming lane following"
+                                f"Phase 3 timeout ({self.PHASE_TIMEOUT_TURN}s): Resuming lane following"
                             )
                         else:
                             self.get_logger().info(
@@ -787,7 +840,7 @@ class ObstacleDetectionNode(Node):
             phase3_elapsed = (
                 time.time() - self.phase_start_time if self.phase_start_time else 0
             )
-            if phase3_elapsed >= self.PHASE_TIMEOUT:
+            if phase3_elapsed >= self.PHASE_TIMEOUT_TURN:
                 self.avoidance_active = False
                 self.avoidance_phase = 1
                 self.avoidance_direction = None
@@ -796,7 +849,7 @@ class ObstacleDetectionNode(Node):
                 self.previous_avoidance_error = 0.0
                 self.last_avoidance_error_time = None
                 self.get_logger().info(
-                    f"Phase 3 timeout ({self.PHASE_TIMEOUT}s): Forced exit, resuming lane following"
+                    f"Phase 3 timeout ({self.PHASE_TIMEOUT_TURN}s): Forced exit, resuming lane following"
                 )
 
     def visualize_avoidance(self, frame, obstacle_roi_pts, height, width):
@@ -932,14 +985,26 @@ class ObstacleDetectionNode(Node):
             error = self.calculate_avoidance_error(height, width)
 
             if self.avoidance_phase == 1:
-                # Phase 1: Turn until top corner meets lane edge (no forward movement)
-                angular_z = self.pd_avoidance(error)
-                angular_z = max(
-                    -self.ANGULAR_SPEED_MAX, min(self.ANGULAR_SPEED_MAX, angular_z)
-                )
-
+                # Phase 1: Turn to align corner with lane edge
+                # If alignment not yet achieved, use PD controller
+                # If alignment achieved but obstacle still visible, turn at constant speed
                 twist.linear.x = 0.0  # No forward movement, only turn
-                twist.angular.z = -angular_z  # Inverted for correct robot direction
+
+                if self.phase1_alignment_achieved:
+                    # Alignment done, but obstacle still visible - turn at constant speed
+                    if self.avoidance_direction == "right":
+                        twist.angular.z = (
+                            -self.ANGULAR_SPEED_MAX
+                        )  # Turn right (negative)
+                    else:
+                        twist.angular.z = self.ANGULAR_SPEED_MAX  # Turn left (positive)
+                else:
+                    # Use PD controller to achieve corner alignment
+                    angular_z = self.pd_avoidance(error)
+                    angular_z = max(
+                        -self.ANGULAR_SPEED_MAX, min(self.ANGULAR_SPEED_MAX, angular_z)
+                    )
+                    twist.angular.z = -angular_z  # Inverted for correct robot direction
 
             elif self.avoidance_phase == 2:
                 # Phase 2: Move forward only (no steering)
