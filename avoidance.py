@@ -63,9 +63,9 @@ class ObstacleDetectionNode(Node):
         # Obstacle avoidance PD controller parameters
         self.KP_AVOIDANCE = 0.005  # Proportional gain for avoidance
         self.KD_AVOIDANCE = 0.002  # Derivative gain for damping
-        self.LINEAR_SPEED = 0.1  # Normal forward speed (m/s)
+        self.LINEAR_SPEED = 0.05  # Normal forward speed (m/s)
         self.LINEAR_SPEED_SLOW = 0.05  # Slow speed during avoidance (m/s)
-        self.ANGULAR_SPEED_MAX = 0.5  # Max angular velocity (rad/s)
+        self.ANGULAR_SPEED_MAX = 0.2  # Max angular velocity (rad/s)
 
         # PD state variables
         self.previous_avoidance_error = 0.0
@@ -501,6 +501,19 @@ class ObstacleDetectionNode(Node):
         else:
             return center_x + bottom_width // 2
 
+    def get_lane_roi_bottom_corner_x(self, side, height, width):
+        """
+        Get the x-coordinate of the lane ROI corner at bottom.
+        Lane ROI has full width at bottom.
+        """
+        bottom_width = width  # Lane ROI is full width at bottom
+        center_x = width // 2
+
+        if side == "left":
+            return center_x - bottom_width // 2
+        else:
+            return center_x + bottom_width // 2
+
     def get_lane_edge_x_at_bottom(self, side, height, width):
         """
         Get the x-coordinate of the lane edge at the bottom of the ROI.
@@ -546,8 +559,8 @@ class ObstacleDetectionNode(Node):
         - Obstacle on right -> target: right ROI bottom corner reaches left lane edge
 
         Phase 3 (Align back):
-        - Obstacle was on left -> turn left -> target: right ROI corners align with left lane edge
-        - Obstacle was on right -> turn right -> target: left ROI corners align with right lane edge
+        - Obstacle was on left -> turn left -> target: left ROI top corner aligns with left lane edge
+        - Obstacle was on right -> turn right -> target: right ROI top corner aligns with right lane edge
 
         Returns: error (positive = turn right, negative = turn left)
         """
@@ -575,9 +588,9 @@ class ObstacleDetectionNode(Node):
                 error = lane_edge_x - roi_corner_x
 
         elif self.avoidance_phase == 2:
-            # Phase 2: Move forward until bottom corner aligns
+            # Phase 2: Move forward until lane ROI bottom corner aligns with lane edge
             if self.obstacle_side == "left":
-                roi_corner_x = self.get_obstacle_roi_bottom_corner_x(
+                roi_corner_x = self.get_lane_roi_bottom_corner_x(
                     "left", height, width
                 )
                 lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
@@ -588,7 +601,7 @@ class ObstacleDetectionNode(Node):
                 error = lane_edge_x - roi_corner_x
 
             else:  # obstacle on right
-                roi_corner_x = self.get_obstacle_roi_bottom_corner_x(
+                roi_corner_x = self.get_lane_roi_bottom_corner_x(
                     "right", height, width
                 )
                 lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
@@ -600,34 +613,26 @@ class ObstacleDetectionNode(Node):
 
         else:  # Phase 3: Align back - turn opposite direction to realign with lane
             if self.obstacle_side == "left":
-                # Obstacle was on left, now align LEFT corners with LEFT lane edge
+                # Obstacle was on left, now align LEFT top corner with LEFT lane edge
                 top_corner_x = self.get_obstacle_roi_corner_x("left", height, width)
-                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("left", height, width)
                 top_lane_edge_x = self.get_lane_edge_x("left", height, width)
-                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
 
-                if top_lane_edge_x is None or bottom_lane_edge_x is None:
+                if top_lane_edge_x is None:
                     return -100  # Default turn left if no lane detected
 
-                # Average error from both corners
-                top_error = top_lane_edge_x - top_corner_x
-                bottom_error = bottom_lane_edge_x - bottom_corner_x
-                error = (top_error + bottom_error) / 2
+                # Error based on top corner only
+                error = top_lane_edge_x - top_corner_x
 
             else:  # obstacle was on right
-                # Obstacle was on right, now align RIGHT corners with RIGHT lane edge
+                # Obstacle was on right, now align RIGHT top corner with RIGHT lane edge
                 top_corner_x = self.get_obstacle_roi_corner_x("right", height, width)
-                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("right", height, width)
                 top_lane_edge_x = self.get_lane_edge_x("right", height, width)
-                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
 
-                if top_lane_edge_x is None or bottom_lane_edge_x is None:
+                if top_lane_edge_x is None:
                     return 100  # Default turn right if no lane detected
 
-                # Average error from both corners
-                top_error = top_lane_edge_x - top_corner_x
-                bottom_error = bottom_lane_edge_x - bottom_corner_x
-                error = (top_error + bottom_error) / 2
+                # Error based on top corner only
+                error = top_lane_edge_x - top_corner_x
 
         return error
 
@@ -718,8 +723,10 @@ class ObstacleDetectionNode(Node):
                         )
 
                 elif self.avoidance_phase == 3:
-                    # Check if Phase 3 is complete (both corners aligned)
-                    if error is not None and abs(error) < 25:  # Slightly more tolerance for dual alignment
+                    # Check if Phase 3 is complete (top corner aligned with lane edge)
+                    if (
+                        error is not None and abs(error) < 50
+                    ):  # Increased tolerance to handle lane detection noise
                         self.avoidance_active = False
                         self.avoidance_phase = 1
                         self.avoidance_direction = None
@@ -768,9 +775,9 @@ class ObstacleDetectionNode(Node):
             status = f"PHASE 1: Turn {self.avoidance_direction.upper()}"
 
         elif self.avoidance_phase == 2:
-            # Phase 2: Show bottom corner and lane edge target
+            # Phase 2: Show lane ROI bottom corner and lane edge target
             if self.obstacle_side == "left":
-                corner_x = self.get_obstacle_roi_bottom_corner_x("left", height, width)
+                corner_x = self.get_lane_roi_bottom_corner_x("left", height, width)
                 lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
                 # Draw corner point (cyan)
                 cv2.circle(frame, (corner_x, bottom_y), 10, (255, 255, 0), -1)
@@ -785,7 +792,7 @@ class ObstacleDetectionNode(Node):
                         2,
                     )
             else:
-                corner_x = self.get_obstacle_roi_bottom_corner_x("right", height, width)
+                corner_x = self.get_lane_roi_bottom_corner_x("right", height, width)
                 lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
                 cv2.circle(frame, (corner_x, bottom_y), 10, (255, 255, 0), -1)
                 if lane_edge_x is not None:
@@ -801,33 +808,29 @@ class ObstacleDetectionNode(Node):
             status = f"PHASE 2: Move FORWARD"
 
         else:  # Phase 3
-            # Phase 3: Show both corners aligning with same-side lane edge
+            # Phase 3: Show top corner aligning with same-side lane edge
             turn_dir = "LEFT" if self.obstacle_side == "left" else "RIGHT"
-            
+
             if self.obstacle_side == "left":
-                # Align LEFT corners with LEFT lane edge
+                # Align LEFT top corner with LEFT lane edge
                 top_corner_x = self.get_obstacle_roi_corner_x("left", height, width)
-                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("left", height, width)
                 top_lane_edge_x = self.get_lane_edge_x("left", height, width)
-                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
             else:
-                # Align RIGHT corners with RIGHT lane edge
+                # Align RIGHT top corner with RIGHT lane edge
                 top_corner_x = self.get_obstacle_roi_corner_x("right", height, width)
-                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("right", height, width)
                 top_lane_edge_x = self.get_lane_edge_x("right", height, width)
-                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
 
             # Draw top corner and target (cyan to magenta)
             cv2.circle(frame, (top_corner_x, top_y), 10, (255, 255, 0), -1)
             if top_lane_edge_x is not None:
                 cv2.circle(frame, (top_lane_edge_x, top_y), 10, (255, 0, 255), -1)
-                cv2.line(frame, (top_corner_x, top_y), (top_lane_edge_x, top_y), (255, 0, 255), 2)
-
-            # Draw bottom corner and target (cyan to magenta)
-            cv2.circle(frame, (bottom_corner_x, bottom_y), 10, (255, 255, 0), -1)
-            if bottom_lane_edge_x is not None:
-                cv2.circle(frame, (bottom_lane_edge_x, bottom_y), 10, (255, 0, 255), -1)
-                cv2.line(frame, (bottom_corner_x, bottom_y), (bottom_lane_edge_x, bottom_y), (255, 0, 255), 2)
+                cv2.line(
+                    frame,
+                    (top_corner_x, top_y),
+                    (top_lane_edge_x, top_y),
+                    (255, 0, 255),
+                    2,
+                )
 
             status = f"PHASE 3: Turn {turn_dir} (align)"
 
@@ -867,39 +870,28 @@ class ObstacleDetectionNode(Node):
             error = self.calculate_avoidance_error(height, width)
 
             if self.avoidance_phase == 1:
-                # Phase 1: Turn until top corner meets lane edge
+                # Phase 1: Turn until top corner meets lane edge (no forward movement)
                 angular_z = self.pd_avoidance(error)
                 angular_z = max(
                     -self.ANGULAR_SPEED_MAX, min(self.ANGULAR_SPEED_MAX, angular_z)
                 )
 
-                twist.linear.x = (
-                    self.LINEAR_SPEED_SLOW * 0.5
-                )  # Very slow forward while turning
+                twist.linear.x = 0.0  # No forward movement, only turn
                 twist.angular.z = -angular_z  # Inverted for correct robot direction
 
             elif self.avoidance_phase == 2:
-                # Phase 2: Move forward with minor steering correction
-                angular_z = self.pd_avoidance(error)
-                # Reduce angular correction in phase 2 (mostly forward motion)
-                angular_z = max(
-                    -self.ANGULAR_SPEED_MAX * 0.3,
-                    min(self.ANGULAR_SPEED_MAX * 0.3, angular_z),
-                )
-
+                # Phase 2: Move forward only (no steering)
                 twist.linear.x = self.LINEAR_SPEED  # Normal forward speed
-                twist.angular.z = -angular_z  # Inverted for correct robot direction
+                twist.angular.z = 0.0  # No turning, only forward
 
             else:  # Phase 3
-                # Phase 3: Turn back to align with lane
+                # Phase 3: Turn back to align with lane (no forward movement)
                 angular_z = self.pd_avoidance(error)
                 angular_z = max(
                     -self.ANGULAR_SPEED_MAX, min(self.ANGULAR_SPEED_MAX, angular_z)
                 )
 
-                twist.linear.x = (
-                    self.LINEAR_SPEED_SLOW * 0.5
-                )  # Very slow forward while turning
+                twist.linear.x = 0.0  # No forward movement, only turn
                 twist.angular.z = -angular_z  # Inverted for correct robot direction
 
         else:
@@ -908,8 +900,8 @@ class ObstacleDetectionNode(Node):
                 twist.linear.x = self.LINEAR_SPEED
                 # Simple proportional lane following
                 twist.angular.z = (
-                    0.003 * self.lane_error
-                )  # Sign flipped for correct direction
+                    -0.003 * self.lane_error
+                )  # Negative sign for correct direction
                 twist.angular.z = max(-0.3, min(0.3, twist.angular.z))
             else:
                 # No lane detected, stop
