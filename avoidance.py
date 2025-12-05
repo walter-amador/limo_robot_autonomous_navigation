@@ -14,6 +14,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
 
@@ -36,6 +37,10 @@ class ObstacleDetectionNode(Node):
         self.CONE_LOWER_HSV = np.array([100, 100, 150])
         self.CONE_UPPER_HSV = np.array([180, 255, 255])
 
+        # Green line HSV range (lane detection)
+        self.LANE_LOWER_HSV = np.array([30, 90, 25])
+        self.LANE_UPPER_HSV = np.array([85, 250, 255])
+
         # Obstacle detection parameters
         self.OBSTACLE_MIN_AREA = 25  # Minimum contour area to consider as obstacle
         self.OBSTACLE_DANGER_ZONE_Y = 0.70  # Bottom 30% of frame is danger zone
@@ -43,12 +48,34 @@ class ObstacleDetectionNode(Node):
 
         # ROI boundaries
         self.ROI_BLIND_SPOT_Y = 1.0  # Bottom edge (100% of frame height)
-        self.ROI_TOP_Y = 0.48  # Start detection from 40% down
+        self.ROI_TOP_Y = 0.45  # Start detection from 40% down
         self.ROI_BOTTOM_WIDTH = 0.88  # 100% of frame width at bottom
         self.ROI_TOP_WIDTH = 0.5  # 50% of frame width at top
 
         # Obstacle detection results
         self.obstacles = []
+
+        # Lane detection results
+        self.lane_centroid = None
+        self.lane_error = None
+        self.lane_contour = None  # Store lane contour for edge detection
+
+        # Obstacle avoidance PD controller parameters
+        self.KP_AVOIDANCE = 0.005  # Proportional gain for avoidance
+        self.KD_AVOIDANCE = 0.002  # Derivative gain for damping
+        self.LINEAR_SPEED = 0.1  # Normal forward speed (m/s)
+        self.LINEAR_SPEED_SLOW = 0.05  # Slow speed during avoidance (m/s)
+        self.ANGULAR_SPEED_MAX = 0.5  # Max angular velocity (rad/s)
+
+        # PD state variables
+        self.previous_avoidance_error = 0.0
+        self.last_avoidance_error_time = None
+
+        # Avoidance state
+        self.avoidance_active = False
+        self.avoidance_phase = 1  # Phase 1: Turn, Phase 2: Move forward
+        self.avoidance_direction = None  # 'left' or 'right' (direction to turn)
+        self.obstacle_side = None  # 'left' or 'right' (side where obstacle is)
 
         # FPS tracking
         self.last_fps_update = time.time()
@@ -71,8 +98,15 @@ class ObstacleDetectionNode(Node):
             Image, "/camera/image_raw", self.image_callback, qos_profile
         )
 
+        # Publisher for velocity commands
+        self.velocity_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+
+        # Timer for control loop (20 Hz)
+        self.control_timer = self.create_timer(0.05, self.control_callback)
+
         self.get_logger().info("Obstacle Detection Node started")
         self.get_logger().info("Subscribing to: /camera/image_raw")
+        self.get_logger().info("Publishing velocity to: /cmd_vel")
         self.get_logger().info("Press 'q' to quit")
 
     def image_callback(self, msg):
@@ -122,6 +156,67 @@ class ObstacleDetectionNode(Node):
 
         cv2.fillPoly(mask, [pts], 255)
         return mask, pts
+
+    def create_lane_roi_mask(self, height, width):
+        """
+        Create ROI mask for lane detection.
+        Full width trapezoid aligned with obstacle ROI vertical boundaries.
+        """
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        # Use same vertical boundaries as obstacle ROI
+        blind_spot_y = int(height * self.ROI_BLIND_SPOT_Y)  # Bottom edge
+        top_y = int(height * self.ROI_TOP_Y)  # Start detection from top
+
+        # Full width trapezoid
+        bottom_width = width  # 100% of frame width at bottom
+        top_width = int(width * 0.6)  # 60% of frame width at top
+
+        center_x = width // 2
+
+        # Define trapezoid points
+        pts = np.array(
+            [
+                [center_x - top_width // 2, top_y],  # Top-left
+                [center_x + top_width // 2, top_y],  # Top-right
+                [center_x + bottom_width // 2, blind_spot_y],  # Bottom-right
+                [center_x - bottom_width // 2, blind_spot_y],  # Bottom-left
+            ],
+            np.int32,
+        )
+
+        cv2.fillPoly(mask, [pts], 255)
+        return mask, pts
+
+    def process_lane_detection(self, frame, roi_mask):
+        """Process frame to detect lane line and calculate error."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        color_mask = cv2.inRange(hsv, self.LANE_LOWER_HSV, self.LANE_UPPER_HSV)
+
+        combined_mask = cv2.bitwise_and(color_mask, roi_mask)
+
+        kernel = np.ones((5, 5), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        largest_contour = None
+        centroid = None
+        error = None
+
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            M = cv2.moments(largest_contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                centroid = (cx, cy)
+                center_x = frame.shape[1] // 2
+                error = cx - center_x
+
+        return combined_mask, largest_contour, centroid, error
 
     def detect_obstacles(self, frame, height, width):
         """
@@ -211,12 +306,26 @@ class ObstacleDetectionNode(Node):
         warning_y = int(height * self.OBSTACLE_WARNING_ZONE_Y)
 
         cv2.line(frame, (0, danger_y), (width, danger_y), (0, 0, 255), 1)
-        cv2.putText(frame, "DANGER ZONE", (width - 120, danger_y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        cv2.putText(
+            frame,
+            "DANGER ZONE",
+            (width - 120, danger_y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (0, 0, 255),
+            1,
+        )
 
         cv2.line(frame, (0, warning_y), (width, warning_y), (0, 165, 255), 1)
-        cv2.putText(frame, "WARNING ZONE", (width - 130, warning_y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+        cv2.putText(
+            frame,
+            "WARNING ZONE",
+            (width - 130, warning_y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (0, 165, 255),
+            1,
+        )
 
         # Draw detected obstacles
         for obs in obstacles:
@@ -236,23 +345,79 @@ class ObstacleDetectionNode(Node):
             cv2.circle(frame, (cx, cy), 5, color, -1)
 
             label = f"{zone.upper()} off:{obs['offset']:+d}"
-            cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(
+                frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
+            )
 
         # Show obstacle count
         if len(obstacles) > 0:
-            cv2.putText(frame, f"Obstacles: {len(obstacles)}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(
+                frame,
+                f"Obstacles: {len(obstacles)}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+
+    def visualize_lane(
+        self, frame, lane_roi_pts, lane_contour, centroid, error, height, width
+    ):
+        """Visualize lane detection."""
+        # Draw lane detection ROI (trapezoid) in green
+        cv2.polylines(frame, [lane_roi_pts], True, (0, 255, 0), 2)
+
+        # Draw lane contour and centroid
+        if lane_contour is not None:
+            cv2.drawContours(frame, [lane_contour], -1, (0, 255, 0), 2)
+            if centroid is not None:
+                cv2.circle(frame, centroid, 8, (0, 255, 0), -1)
+
+        # Draw center line
+        center_x = width // 2
+        cv2.line(frame, (center_x, 0), (center_x, height), (255, 0, 0), 1)
+
+        # Display error
+        if error is not None:
+            cv2.putText(
+                frame,
+                f"Lane Error: {error:+d}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
 
     def process_frame(self, frame):
         """Process a single frame."""
         frame = cv2.resize(frame, (640, 480))
         height, width = frame.shape[:2]
 
+        # Lane Detection
+        lane_roi_mask, lane_roi_pts = self.create_lane_roi_mask(height, width)
+        lane_mask, self.lane_contour, self.lane_centroid, self.lane_error = (
+            self.process_lane_detection(frame, lane_roi_mask)
+        )
+
         # Obstacle Detection
-        self.obstacles, obstacle_mask, obstacle_roi_pts = self.detect_obstacles(frame, height, width)
+        self.obstacles, obstacle_mask, obstacle_roi_pts = self.detect_obstacles(
+            frame, height, width
+        )
 
         # Visualizations
+        self.visualize_lane(
+            frame,
+            lane_roi_pts,
+            self.lane_contour,
+            self.lane_centroid,
+            self.lane_error,
+            height,
+            width,
+        )
         self.visualize_obstacles(frame, self.obstacles, obstacle_roi_pts, height, width)
+        self.visualize_avoidance(frame, obstacle_roi_pts, height, width)
 
         # Update FPS
         self.frame_count += 1
@@ -263,13 +428,504 @@ class ObstacleDetectionNode(Node):
             self.last_fps_update = current_time
 
         # Display FPS
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", (width - 100, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(
+            frame,
+            f"FPS: {self.fps:.1f}",
+            (width - 100, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+        )
 
-        return frame, obstacle_mask
+        # Combine masks for display
+        combined_display_mask = cv2.bitwise_or(obstacle_mask, lane_mask)
+
+        return frame, combined_display_mask
+
+    def get_lane_edge_x(self, side, height, width):
+        """
+        Get the x-coordinate of the lane edge at a specific y level.
+        Returns the left or right edge of the detected green line.
+        """
+        if self.lane_contour is None:
+            return None
+
+        # Get the y-level at the top of the obstacle ROI
+        top_y = int(height * self.ROI_TOP_Y)
+
+        # Find lane contour points near the top_y level
+        tolerance = 30  # pixels tolerance for y-level matching
+        edge_points = []
+
+        for point in self.lane_contour:
+            px, py = point[0]
+            if abs(py - top_y) < tolerance:
+                edge_points.append(px)
+
+        if not edge_points:
+            # If no points at that level, use the overall bounding box
+            x, y, w, h = cv2.boundingRect(self.lane_contour)
+            if side == "left":
+                return x
+            else:
+                return x + w
+
+        if side == "left":
+            return min(edge_points)
+        else:
+            return max(edge_points)
+
+    def get_obstacle_roi_corner_x(self, side, height, width):
+        """
+        Get the x-coordinate of the obstacle ROI corner at top.
+        """
+        top_y = int(height * self.ROI_TOP_Y)
+        top_width = int(width * self.ROI_TOP_WIDTH)
+        center_x = width // 2
+
+        if side == "left":
+            return center_x - top_width // 2
+        else:
+            return center_x + top_width // 2
+
+    def get_obstacle_roi_bottom_corner_x(self, side, height, width):
+        """
+        Get the x-coordinate of the obstacle ROI corner at bottom.
+        """
+        bottom_width = int(width * self.ROI_BOTTOM_WIDTH)
+        center_x = width // 2
+
+        if side == "left":
+            return center_x - bottom_width // 2
+        else:
+            return center_x + bottom_width // 2
+
+    def get_lane_edge_x_at_bottom(self, side, height, width):
+        """
+        Get the x-coordinate of the lane edge at the bottom of the ROI.
+        """
+        if self.lane_contour is None:
+            return None
+
+        # Get the y-level at the bottom of the obstacle ROI
+        bottom_y = int(height * self.ROI_BLIND_SPOT_Y)
+
+        # Find lane contour points near the bottom_y level
+        tolerance = 30  # pixels tolerance for y-level matching
+        edge_points = []
+
+        for point in self.lane_contour:
+            px, py = point[0]
+            if abs(py - bottom_y) < tolerance:
+                edge_points.append(px)
+
+        if not edge_points:
+            # If no points at that level, use the overall bounding box
+            x, y, w, h = cv2.boundingRect(self.lane_contour)
+            if side == "left":
+                return x
+            else:
+                return x + w
+
+        if side == "left":
+            return min(edge_points)
+        else:
+            return max(edge_points)
+
+    def calculate_avoidance_error(self, height, width):
+        """
+        Calculate the error for obstacle avoidance.
+
+        Phase 1 (Turn):
+        - Obstacle on left -> turn right -> target: left ROI top corner reaches right lane edge
+        - Obstacle on right -> turn left -> target: right ROI top corner reaches left lane edge
+
+        Phase 2 (Move forward):
+        - Obstacle on left -> target: left ROI bottom corner reaches right lane edge
+        - Obstacle on right -> target: right ROI bottom corner reaches left lane edge
+
+        Phase 3 (Align back):
+        - Obstacle was on left -> turn left -> target: right ROI corners align with left lane edge
+        - Obstacle was on right -> turn right -> target: left ROI corners align with right lane edge
+
+        Returns: error (positive = turn right, negative = turn left)
+        """
+        if not self.avoidance_active or self.obstacle_side is None:
+            return None
+
+        if self.avoidance_phase == 1:
+            # Phase 1: Turn until top corner meets lane edge
+            if self.obstacle_side == "left":
+                roi_corner_x = self.get_obstacle_roi_corner_x("left", height, width)
+                lane_edge_x = self.get_lane_edge_x("right", height, width)
+
+                if lane_edge_x is None:
+                    return 100  # Default turn right if no lane detected
+
+                error = lane_edge_x - roi_corner_x
+
+            else:  # obstacle on right
+                roi_corner_x = self.get_obstacle_roi_corner_x("right", height, width)
+                lane_edge_x = self.get_lane_edge_x("left", height, width)
+
+                if lane_edge_x is None:
+                    return -100  # Default turn left if no lane detected
+
+                error = lane_edge_x - roi_corner_x
+
+        elif self.avoidance_phase == 2:
+            # Phase 2: Move forward until bottom corner aligns
+            if self.obstacle_side == "left":
+                roi_corner_x = self.get_obstacle_roi_bottom_corner_x(
+                    "left", height, width
+                )
+                lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
+
+                if lane_edge_x is None:
+                    return 100  # Default if no lane detected
+
+                error = lane_edge_x - roi_corner_x
+
+            else:  # obstacle on right
+                roi_corner_x = self.get_obstacle_roi_bottom_corner_x(
+                    "right", height, width
+                )
+                lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
+
+                if lane_edge_x is None:
+                    return -100  # Default if no lane detected
+
+                error = lane_edge_x - roi_corner_x
+
+        else:  # Phase 3: Align back - turn opposite direction to realign with lane
+            if self.obstacle_side == "left":
+                # Obstacle was on left, now align LEFT corners with LEFT lane edge
+                top_corner_x = self.get_obstacle_roi_corner_x("left", height, width)
+                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("left", height, width)
+                top_lane_edge_x = self.get_lane_edge_x("left", height, width)
+                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
+
+                if top_lane_edge_x is None or bottom_lane_edge_x is None:
+                    return -100  # Default turn left if no lane detected
+
+                # Average error from both corners
+                top_error = top_lane_edge_x - top_corner_x
+                bottom_error = bottom_lane_edge_x - bottom_corner_x
+                error = (top_error + bottom_error) / 2
+
+            else:  # obstacle was on right
+                # Obstacle was on right, now align RIGHT corners with RIGHT lane edge
+                top_corner_x = self.get_obstacle_roi_corner_x("right", height, width)
+                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("right", height, width)
+                top_lane_edge_x = self.get_lane_edge_x("right", height, width)
+                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
+
+                if top_lane_edge_x is None or bottom_lane_edge_x is None:
+                    return 100  # Default turn right if no lane detected
+
+                # Average error from both corners
+                top_error = top_lane_edge_x - top_corner_x
+                bottom_error = bottom_lane_edge_x - bottom_corner_x
+                error = (top_error + bottom_error) / 2
+
+        return error
+
+    def pd_avoidance(self, error):
+        """
+        Calculate angular velocity using PD controller for avoidance.
+        """
+        if error is None:
+            self.previous_avoidance_error = 0.0
+            self.last_avoidance_error_time = None
+            return 0.0
+
+        current_time = time.time()
+
+        # Proportional term
+        p_term = self.KP_AVOIDANCE * error
+
+        # Derivative term
+        d_term = 0.0
+        if self.last_avoidance_error_time is not None:
+            dt = current_time - self.last_avoidance_error_time
+            if dt > 0:
+                error_derivative = (error - self.previous_avoidance_error) / dt
+                d_term = self.KD_AVOIDANCE * error_derivative
+
+        # Update state
+        self.previous_avoidance_error = error
+        self.last_avoidance_error_time = current_time
+
+        return p_term + d_term
+
+    def update_avoidance_state(self, height, width):
+        """
+        Update the avoidance state based on detected obstacles.
+        Handles three phases:
+        - Phase 1: Turn until top corner meets lane edge
+        - Phase 2: Move forward until bottom corner aligns with lane edge
+        - Phase 3: Turn back to align both corners with opposite lane edge
+        """
+        center_x = width // 2
+
+        # Check for obstacles in warning or danger zone
+        active_obstacle = None
+        for obs in self.obstacles:
+            if obs["zone"] in ["warning", "danger"]:
+                active_obstacle = obs
+                break  # Take the closest one (already sorted)
+
+        if active_obstacle is not None:
+            # Determine which side the obstacle is on
+            if active_obstacle["offset"] < 0:
+                self.obstacle_side = "left"
+                self.avoidance_direction = "right"
+            else:
+                self.obstacle_side = "right"
+                self.avoidance_direction = "left"
+
+            if not self.avoidance_active:
+                # Start new avoidance maneuver
+                self.avoidance_active = True
+                self.avoidance_phase = 1
+                self.get_logger().info(
+                    f"Avoidance started: obstacle on {self.obstacle_side}, turning {self.avoidance_direction}"
+                )
+        else:
+            # No active obstacle - check phase transitions and completion
+            if self.avoidance_active:
+                error = self.calculate_avoidance_error(height, width)
+
+                if self.avoidance_phase == 1:
+                    # Check if Phase 1 is complete (top corner near lane edge)
+                    if error is not None and abs(error) < 20:
+                        self.avoidance_phase = 2
+                        self.previous_avoidance_error = 0.0
+                        self.last_avoidance_error_time = None
+                        self.get_logger().info(
+                            "Phase 1 complete: Turn done, moving forward"
+                        )
+
+                elif self.avoidance_phase == 2:
+                    # Check if Phase 2 is complete (bottom corner near lane edge)
+                    if error is not None and abs(error) < 20:
+                        self.avoidance_phase = 3
+                        self.previous_avoidance_error = 0.0
+                        self.last_avoidance_error_time = None
+                        self.get_logger().info(
+                            "Phase 2 complete: Moving forward done, aligning back"
+                        )
+
+                elif self.avoidance_phase == 3:
+                    # Check if Phase 3 is complete (both corners aligned)
+                    if error is not None and abs(error) < 25:  # Slightly more tolerance for dual alignment
+                        self.avoidance_active = False
+                        self.avoidance_phase = 1
+                        self.avoidance_direction = None
+                        self.obstacle_side = None
+                        self.previous_avoidance_error = 0.0
+                        self.last_avoidance_error_time = None
+                        self.get_logger().info(
+                            "Avoidance complete: Resuming lane following"
+                        )
+
+    def visualize_avoidance(self, frame, obstacle_roi_pts, height, width):
+        """
+        Visualize avoidance state and targets for all three phases.
+        """
+        if not self.avoidance_active:
+            return
+
+        top_y = int(height * self.ROI_TOP_Y)
+        bottom_y = (
+            int(height * self.ROI_BLIND_SPOT_Y) - 1
+        )  # Slight offset to stay in frame
+
+        if self.avoidance_phase == 1:
+            # Phase 1: Show top corner and lane edge target
+            if self.obstacle_side == "left":
+                corner_x = self.get_obstacle_roi_corner_x("left", height, width)
+                lane_edge_x = self.get_lane_edge_x("right", height, width)
+                # Draw corner point (cyan)
+                cv2.circle(frame, (corner_x, top_y), 10, (255, 255, 0), -1)
+                # Draw target lane edge (magenta)
+                if lane_edge_x is not None:
+                    cv2.circle(frame, (lane_edge_x, top_y), 10, (255, 0, 255), -1)
+                    cv2.line(
+                        frame, (corner_x, top_y), (lane_edge_x, top_y), (255, 0, 255), 2
+                    )
+            else:
+                corner_x = self.get_obstacle_roi_corner_x("right", height, width)
+                lane_edge_x = self.get_lane_edge_x("left", height, width)
+                cv2.circle(frame, (corner_x, top_y), 10, (255, 255, 0), -1)
+                if lane_edge_x is not None:
+                    cv2.circle(frame, (lane_edge_x, top_y), 10, (255, 0, 255), -1)
+                    cv2.line(
+                        frame, (corner_x, top_y), (lane_edge_x, top_y), (255, 0, 255), 2
+                    )
+
+            status = f"PHASE 1: Turn {self.avoidance_direction.upper()}"
+
+        elif self.avoidance_phase == 2:
+            # Phase 2: Show bottom corner and lane edge target
+            if self.obstacle_side == "left":
+                corner_x = self.get_obstacle_roi_bottom_corner_x("left", height, width)
+                lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
+                # Draw corner point (cyan)
+                cv2.circle(frame, (corner_x, bottom_y), 10, (255, 255, 0), -1)
+                # Draw target lane edge (magenta)
+                if lane_edge_x is not None:
+                    cv2.circle(frame, (lane_edge_x, bottom_y), 10, (255, 0, 255), -1)
+                    cv2.line(
+                        frame,
+                        (corner_x, bottom_y),
+                        (lane_edge_x, bottom_y),
+                        (255, 0, 255),
+                        2,
+                    )
+            else:
+                corner_x = self.get_obstacle_roi_bottom_corner_x("right", height, width)
+                lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
+                cv2.circle(frame, (corner_x, bottom_y), 10, (255, 255, 0), -1)
+                if lane_edge_x is not None:
+                    cv2.circle(frame, (lane_edge_x, bottom_y), 10, (255, 0, 255), -1)
+                    cv2.line(
+                        frame,
+                        (corner_x, bottom_y),
+                        (lane_edge_x, bottom_y),
+                        (255, 0, 255),
+                        2,
+                    )
+
+            status = f"PHASE 2: Move FORWARD"
+
+        else:  # Phase 3
+            # Phase 3: Show both corners aligning with same-side lane edge
+            turn_dir = "LEFT" if self.obstacle_side == "left" else "RIGHT"
+            
+            if self.obstacle_side == "left":
+                # Align LEFT corners with LEFT lane edge
+                top_corner_x = self.get_obstacle_roi_corner_x("left", height, width)
+                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("left", height, width)
+                top_lane_edge_x = self.get_lane_edge_x("left", height, width)
+                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("left", height, width)
+            else:
+                # Align RIGHT corners with RIGHT lane edge
+                top_corner_x = self.get_obstacle_roi_corner_x("right", height, width)
+                bottom_corner_x = self.get_obstacle_roi_bottom_corner_x("right", height, width)
+                top_lane_edge_x = self.get_lane_edge_x("right", height, width)
+                bottom_lane_edge_x = self.get_lane_edge_x_at_bottom("right", height, width)
+
+            # Draw top corner and target (cyan to magenta)
+            cv2.circle(frame, (top_corner_x, top_y), 10, (255, 255, 0), -1)
+            if top_lane_edge_x is not None:
+                cv2.circle(frame, (top_lane_edge_x, top_y), 10, (255, 0, 255), -1)
+                cv2.line(frame, (top_corner_x, top_y), (top_lane_edge_x, top_y), (255, 0, 255), 2)
+
+            # Draw bottom corner and target (cyan to magenta)
+            cv2.circle(frame, (bottom_corner_x, bottom_y), 10, (255, 255, 0), -1)
+            if bottom_lane_edge_x is not None:
+                cv2.circle(frame, (bottom_lane_edge_x, bottom_y), 10, (255, 0, 255), -1)
+                cv2.line(frame, (bottom_corner_x, bottom_y), (bottom_lane_edge_x, bottom_y), (255, 0, 255), 2)
+
+            status = f"PHASE 3: Turn {turn_dir} (align)"
+
+        # Display avoidance status
+        cv2.putText(
+            frame, status, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
+        )
+
+        error = self.calculate_avoidance_error(height, width)
+        if error is not None:
+            cv2.putText(
+                frame,
+                f"Avoid Error: {error:+.0f}",
+                (10, 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 0, 255),
+                2,
+            )
+
+    def control_callback(self):
+        """
+        Control loop - sends velocity commands to robot.
+        Phase 1: Turn in place (or slow forward) until top corner aligns
+        Phase 2: Move forward with slight correction until bottom corner aligns
+        Phase 3: Turn back to align both corners with opposite lane edge
+        """
+        twist = Twist()
+
+        # Get frame dimensions (assuming 640x480)
+        height, width = 480, 640
+
+        # Update avoidance state
+        self.update_avoidance_state(height, width)
+
+        if self.avoidance_active:
+            error = self.calculate_avoidance_error(height, width)
+
+            if self.avoidance_phase == 1:
+                # Phase 1: Turn until top corner meets lane edge
+                angular_z = self.pd_avoidance(error)
+                angular_z = max(
+                    -self.ANGULAR_SPEED_MAX, min(self.ANGULAR_SPEED_MAX, angular_z)
+                )
+
+                twist.linear.x = (
+                    self.LINEAR_SPEED_SLOW * 0.5
+                )  # Very slow forward while turning
+                twist.angular.z = -angular_z  # Inverted for correct robot direction
+
+            elif self.avoidance_phase == 2:
+                # Phase 2: Move forward with minor steering correction
+                angular_z = self.pd_avoidance(error)
+                # Reduce angular correction in phase 2 (mostly forward motion)
+                angular_z = max(
+                    -self.ANGULAR_SPEED_MAX * 0.3,
+                    min(self.ANGULAR_SPEED_MAX * 0.3, angular_z),
+                )
+
+                twist.linear.x = self.LINEAR_SPEED  # Normal forward speed
+                twist.angular.z = -angular_z  # Inverted for correct robot direction
+
+            else:  # Phase 3
+                # Phase 3: Turn back to align with lane
+                angular_z = self.pd_avoidance(error)
+                angular_z = max(
+                    -self.ANGULAR_SPEED_MAX, min(self.ANGULAR_SPEED_MAX, angular_z)
+                )
+
+                twist.linear.x = (
+                    self.LINEAR_SPEED_SLOW * 0.5
+                )  # Very slow forward while turning
+                twist.angular.z = -angular_z  # Inverted for correct robot direction
+
+        else:
+            # Normal lane following mode (simple proportional)
+            if self.lane_error is not None:
+                twist.linear.x = self.LINEAR_SPEED
+                # Simple proportional lane following
+                twist.angular.z = (
+                    0.003 * self.lane_error
+                )  # Sign flipped for correct direction
+                twist.angular.z = max(-0.3, min(0.3, twist.angular.z))
+            else:
+                # No lane detected, stop
+                twist.linear.x = 0.0
+                twist.angular.z = 0.0
+
+        self.velocity_pub.publish(twist)
 
     def destroy_node(self):
         """Cleanup resources"""
+        # Stop the robot
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        self.velocity_pub.publish(twist)
+
         cv2.destroyAllWindows()
         super().destroy_node()
 
@@ -285,7 +941,9 @@ def main(args=None):
         print("ROS2 Obstacle Detection Node")
         print("=" * 60)
         print("Subscribing to: /camera/image_raw")
-        print("Orange obstacle HSV range:", node.CONE_LOWER_HSV, "-", node.CONE_UPPER_HSV)
+        print(
+            "Orange obstacle HSV range:", node.CONE_LOWER_HSV, "-", node.CONE_UPPER_HSV
+        )
         print("\nPress 'q' in visualization window to quit")
         print("=" * 60 + "\n")
 
