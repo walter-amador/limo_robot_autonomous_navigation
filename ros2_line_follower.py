@@ -1564,15 +1564,43 @@ class LineFollowerNode(Node):
         if self.avoidance_active:
             # === AVOIDANCE PRIORITY ===
             # Override all other behaviors when avoiding an obstacle
-            twist.linear.x = self.LINEAR_SPEED_SLOW
-            if self.avoidance_steering_cmd is not None:
-                twist.angular.z = self.avoidance_steering_cmd
-
-                # Limit angular velocity
-                max_angular = 1.0
-                twist.angular.z = max(-max_angular, min(max_angular, twist.angular.z))
-            else:
-                twist.angular.z = 0.0
+            # Phase-specific control matching avoidance.py logic
+            
+            if self.avoidance_phase == 1:
+                # Phase 1: Turn to align corner with lane edge (no forward movement)
+                twist.linear.x = 0.0
+                
+                if self.phase1_alignment_achieved:
+                    # Alignment done, but obstacle still visible - turn at constant speed
+                    if self.avoidance_direction == "right":
+                        twist.angular.z = -self.ANGULAR_SPEED_MAX_AVOIDANCE  # Turn right (negative)
+                    else:
+                        twist.angular.z = self.ANGULAR_SPEED_MAX_AVOIDANCE  # Turn left (positive)
+                else:
+                    # Use PD controller to achieve corner alignment
+                    if self.avoidance_steering_cmd is not None:
+                        twist.angular.z = max(
+                            -self.ANGULAR_SPEED_MAX_AVOIDANCE,
+                            min(self.ANGULAR_SPEED_MAX_AVOIDANCE, self.avoidance_steering_cmd)
+                        )
+                    else:
+                        twist.angular.z = 0.0
+                        
+            elif self.avoidance_phase == 2:
+                # Phase 2: Move forward only (no steering)
+                twist.linear.x = self.LINEAR_SPEED_AVOIDANCE  # Normal forward speed
+                twist.angular.z = 0.0  # No turning, only forward
+                
+            else:  # Phase 3
+                # Phase 3: Turn back to align with lane (no forward movement)
+                twist.linear.x = 0.0
+                if self.avoidance_steering_cmd is not None:
+                    twist.angular.z = max(
+                        -self.ANGULAR_SPEED_MAX_AVOIDANCE,
+                        min(self.ANGULAR_SPEED_MAX_AVOIDANCE, self.avoidance_steering_cmd)
+                    )
+                else:
+                    twist.angular.z = 0.0
 
         elif self.state["fsm"] == "STOP_WAIT":
             # Robot stopped at stop sign
