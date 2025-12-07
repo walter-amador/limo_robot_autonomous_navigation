@@ -174,7 +174,7 @@ class LineFollowerNode(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             durability=DurabilityPolicy.VOLATILE,
-            depth=10,
+            depth=1,
         )
 
         # Subscriber for camera images
@@ -1369,7 +1369,7 @@ class LineFollowerNode(Node):
             if self.show_visualization:
                 # cv2.imshow("Mask", processed_mask)
                 # Show obstacle detection mask (orange cone HSV detection)
-                # cv2.imshow("Obstacle Mask", obstacle_mask)
+                cv2.imshow("Obstacle Mask", obstacle_mask)
                 cv2.imshow("Line Follower", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
@@ -1394,6 +1394,7 @@ class LineFollowerNode(Node):
         if self.state["fsm"] == "FOLLOW_LANE":
             stop_detected = False
             direction_detected = None
+            turn_180_detected = False
 
             for det in detections:
                 _, y1, _, _ = det["box"]
@@ -1406,6 +1407,19 @@ class LineFollowerNode(Node):
                             stop_detected = True
                     elif det["class_name"] in ["left", "right", "forward"]:
                         direction_detected = det["class_name"]
+                    elif det["class_name"] in ["dead_end", "no_entry"]:
+                        turn_180_detected = True
+                        self.get_logger().warn(
+                            f"{det['class_name'].upper()} sign detected - initiating 180 turn"
+                        )
+
+            # DEAD_END and NO_ENTRY have highest priority - trigger 180 turn immediately
+            if turn_180_detected:
+                self.state["fsm"] = "TURN_180"
+                self.state["turn_start_time"] = time.time()
+                self.state["junction_deciding"] = False
+                self.state["junction_detected_time"] = None
+                return
 
             if stop_detected:
                 self.state["fsm"] = "STOP_WAIT"
@@ -1554,7 +1568,7 @@ class LineFollowerNode(Node):
 
                 # Check if we've completed the turn and can return to normal following
                 if self.state["roi_mode"] == "bottom_left":
-                    if -50 <= error <= 10:  # Wider tolerance for resuming
+                    if -25 <= error <= 10:  # Wider tolerance for resuming
                         self.state["roi_mode"] = "custom_rect"
                         self.state["search_direction"] = None
                         self.state["junction_detected_time"] = None
@@ -1565,7 +1579,7 @@ class LineFollowerNode(Node):
                             "Left turn complete, resuming normal speed"
                         )
                 elif self.state["roi_mode"] == "bottom_right":
-                    if -10 <= error <= 50:  # Wider tolerance for resuming
+                    if -10 <= error <= 25:  # Wider tolerance for resuming
                         self.state["roi_mode"] = "custom_rect"
                         self.state["search_direction"] = None
                         self.state["junction_detected_time"] = None
