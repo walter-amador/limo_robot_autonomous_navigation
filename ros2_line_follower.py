@@ -93,7 +93,9 @@ class LineFollowerNode(Node):
         # Phase 4 forward clearance distance calculation:
         # Need to clear half robot width + half cone width + safety margin
         self.PHASE4_CLEARANCE_DISTANCE = (
-            (self.ROBOT_WIDTH / 2) + (self.CONE_WIDTH / 2) + self.CLEARANCE_SAFETY_MARGIN
+            (self.ROBOT_WIDTH / 2)
+            + (self.CONE_WIDTH / 2)
+            + self.CLEARANCE_SAFETY_MARGIN
         )  # ~0.23 meters
 
         # Obstacle detection results
@@ -418,7 +420,7 @@ class LineFollowerNode(Node):
     def calculate_avoidance_error(self, height, width):
         """
         Calculate the error for obstacle avoidance.
-        
+
         Phase 1 (Turn):
         - Obstacle on left -> turn right -> target: left ROI top corner reaches right lane edge
         - Obstacle on right -> turn left -> target: right ROI top corner reaches left lane edge
@@ -530,7 +532,9 @@ class LineFollowerNode(Node):
                 lane_edge_x = self.get_lane_edge_x("left", height, width)
 
                 if lane_edge_x is None:
-                    return -100  # Default turn LEFT if no lane detected (lane is to our left)
+                    return (
+                        -100
+                    )  # Default turn LEFT if no lane detected (lane is to our left)
 
                 error = lane_edge_x - roi_corner_x
 
@@ -554,7 +558,7 @@ class LineFollowerNode(Node):
     def pd_avoidance(self, error):
         """
         Calculate angular velocity using PD controller for avoidance.
-        
+
         Note: In ROS2, positive angular.z = turn LEFT, negative angular.z = turn RIGHT
         Our error convention: positive error = need to turn right, negative = turn left
         So we negate the output to match ROS2 convention.
@@ -666,7 +670,9 @@ class LineFollowerNode(Node):
                         self.avoidance_phase = 4
                         self.phase_start_time = time.time()
                         # Calculate Phase 4 duration based on clearance distance and speed
-                        self.phase4_duration = self.PHASE4_CLEARANCE_DISTANCE / self.LINEAR_SPEED_AVOIDANCE
+                        self.phase4_duration = (
+                            self.PHASE4_CLEARANCE_DISTANCE / self.LINEAR_SPEED_AVOIDANCE
+                        )
                         self.get_logger().info(
                             f"AVOIDANCE PHASE 4: Forward Clearance ({self.PHASE4_CLEARANCE_DISTANCE:.2f}m in {self.phase4_duration:.2f}s)"
                         )
@@ -695,7 +701,9 @@ class LineFollowerNode(Node):
             if phase3_elapsed >= self.PHASE_TIMEOUT_TURN:
                 self.avoidance_phase = 4
                 self.phase_start_time = time.time()
-                self.phase4_duration = self.PHASE4_CLEARANCE_DISTANCE / self.LINEAR_SPEED_AVOIDANCE
+                self.phase4_duration = (
+                    self.PHASE4_CLEARANCE_DISTANCE / self.LINEAR_SPEED_AVOIDANCE
+                )
                 self.get_logger().info(
                     f"AVOIDANCE PHASE 4: Forward Clearance (Timeout) ({self.PHASE4_CLEARANCE_DISTANCE:.2f}m in {self.phase4_duration:.2f}s)"
                 )
@@ -705,7 +713,10 @@ class LineFollowerNode(Node):
             phase4_elapsed = (
                 time.time() - self.phase_start_time if self.phase_start_time else 0
             )
-            if hasattr(self, 'phase4_duration') and phase4_elapsed >= self.phase4_duration:
+            if (
+                hasattr(self, "phase4_duration")
+                and phase4_elapsed >= self.phase4_duration
+            ):
                 self.avoidance_phase = 5
                 self.phase_start_time = time.time()
                 self.get_logger().info("AVOIDANCE PHASE 5: Center on Lane")
@@ -790,10 +801,14 @@ class LineFollowerNode(Node):
 
             if self.obstacle_side == "left":
                 top_corner_x = self.get_obstacle_roi_corner_x("left", height, width)
-                top_lane_edge_x = self.get_lane_edge_x("right", height, width)  # Opposite side
+                top_lane_edge_x = self.get_lane_edge_x(
+                    "right", height, width
+                )  # Opposite side
             else:
                 top_corner_x = self.get_obstacle_roi_corner_x("right", height, width)
-                top_lane_edge_x = self.get_lane_edge_x("left", height, width)  # Opposite side
+                top_lane_edge_x = self.get_lane_edge_x(
+                    "left", height, width
+                )  # Opposite side
 
             # Draw top corner and target (cyan to magenta)
             cv2.circle(frame, (top_corner_x, top_y), 10, (255, 255, 0), -1)
@@ -814,23 +829,49 @@ class LineFollowerNode(Node):
             phase4_elapsed = (
                 time.time() - self.phase_start_time if self.phase_start_time else 0
             )
-            phase4_duration = getattr(self, 'phase4_duration', self.PHASE4_CLEARANCE_DISTANCE / self.LINEAR_SPEED_AVOIDANCE)
-            progress = min(1.0, phase4_elapsed / phase4_duration) if phase4_duration > 0 else 1.0
-            
+            phase4_duration = getattr(
+                self,
+                "phase4_duration",
+                self.PHASE4_CLEARANCE_DISTANCE / self.LINEAR_SPEED_AVOIDANCE,
+            )
+            progress = (
+                min(1.0, phase4_elapsed / phase4_duration)
+                if phase4_duration > 0
+                else 1.0
+            )
+
             # Draw progress bar for Phase 4
             bar_x = 10
             bar_y = 150
             bar_width = 200
             bar_height = 20
-            
+
             # Background bar
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+            cv2.rectangle(
+                frame,
+                (bar_x, bar_y),
+                (bar_x + bar_width, bar_y + bar_height),
+                (50, 50, 50),
+                -1,
+            )
             # Progress bar
             progress_width = int(bar_width * progress)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), (0, 255, 0), -1)
+            cv2.rectangle(
+                frame,
+                (bar_x, bar_y),
+                (bar_x + progress_width, bar_y + bar_height),
+                (0, 255, 0),
+                -1,
+            )
             # Border
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
-            
+            cv2.rectangle(
+                frame,
+                (bar_x, bar_y),
+                (bar_x + bar_width, bar_y + bar_height),
+                (255, 255, 255),
+                2,
+            )
+
             status = f"PHASE 4: Forward Clearance ({progress*100:.0f}%)"
 
         else:  # Phase 5
@@ -839,10 +880,14 @@ class LineFollowerNode(Node):
 
             if self.obstacle_side == "left":
                 top_corner_x = self.get_obstacle_roi_corner_x("left", height, width)
-                top_lane_edge_x = self.get_lane_edge_x("left", height, width)  # Same side
+                top_lane_edge_x = self.get_lane_edge_x(
+                    "left", height, width
+                )  # Same side
             else:
                 top_corner_x = self.get_obstacle_roi_corner_x("right", height, width)
-                top_lane_edge_x = self.get_lane_edge_x("right", height, width)  # Same side
+                top_lane_edge_x = self.get_lane_edge_x(
+                    "right", height, width
+                )  # Same side
 
             # Draw top corner and target (cyan to magenta)
             cv2.circle(frame, (top_corner_x, top_y), 10, (255, 255, 0), -1)
@@ -1037,7 +1082,6 @@ class LineFollowerNode(Node):
         lowest_y = contour[:, :, 1].max()
         bottom_threshold = int(frame_height * threshold)
         line_reaches_bottom = lowest_y >= bottom_threshold
-
 
         x, y, w, h = cv2.boundingRect(contour)
         aspect_ratio = w / max(h, 1)
@@ -1323,9 +1367,9 @@ class LineFollowerNode(Node):
             )
 
             if self.show_visualization:
-                #cv2.imshow("Mask", processed_mask)
+                # cv2.imshow("Mask", processed_mask)
                 # Show obstacle detection mask (orange cone HSV detection)
-                #cv2.imshow("Obstacle Mask", obstacle_mask)
+                # cv2.imshow("Obstacle Mask", obstacle_mask)
                 cv2.imshow("Line Follower", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
@@ -1713,39 +1757,49 @@ class LineFollowerNode(Node):
             # === AVOIDANCE PRIORITY ===
             # Override all other behaviors when avoiding an obstacle
             # Phase-specific control matching avoidance.py logic
-            
+
             if self.avoidance_phase == 1:
                 # Phase 1: Turn to align corner with lane edge (no forward movement)
                 twist.linear.x = 0.0
-                
+
                 if self.phase1_alignment_achieved:
                     # Alignment done, but obstacle still visible - turn at constant speed
                     if self.avoidance_direction == "right":
-                        twist.angular.z = -self.ANGULAR_SPEED_MAX_AVOIDANCE  # Turn right (negative)
+                        twist.angular.z = (
+                            -self.ANGULAR_SPEED_MAX_AVOIDANCE
+                        )  # Turn right (negative)
                     else:
-                        twist.angular.z = self.ANGULAR_SPEED_MAX_AVOIDANCE  # Turn left (positive)
+                        twist.angular.z = (
+                            self.ANGULAR_SPEED_MAX_AVOIDANCE
+                        )  # Turn left (positive)
                 else:
                     # Use PD controller to achieve corner alignment
                     if self.avoidance_steering_cmd is not None:
                         twist.angular.z = max(
                             -self.ANGULAR_SPEED_MAX_AVOIDANCE,
-                            min(self.ANGULAR_SPEED_MAX_AVOIDANCE, self.avoidance_steering_cmd)
+                            min(
+                                self.ANGULAR_SPEED_MAX_AVOIDANCE,
+                                self.avoidance_steering_cmd,
+                            ),
                         )
                     else:
                         twist.angular.z = 0.0
-                        
+
             elif self.avoidance_phase == 2:
                 # Phase 2: Move forward only (no steering)
                 twist.linear.x = self.LINEAR_SPEED_AVOIDANCE  # Normal forward speed
                 twist.angular.z = 0.0  # No turning, only forward
-                
+
             elif self.avoidance_phase == 3:
                 # Phase 3: Turn back to align with lane (no forward movement)
                 twist.linear.x = 0.0
                 if self.avoidance_steering_cmd is not None:
                     twist.angular.z = max(
                         -self.ANGULAR_SPEED_MAX_AVOIDANCE,
-                        min(self.ANGULAR_SPEED_MAX_AVOIDANCE, self.avoidance_steering_cmd)
+                        min(
+                            self.ANGULAR_SPEED_MAX_AVOIDANCE,
+                            self.avoidance_steering_cmd,
+                        ),
                     )
                 else:
                     twist.angular.z = 0.0
@@ -1761,7 +1815,10 @@ class LineFollowerNode(Node):
                 if self.avoidance_steering_cmd is not None:
                     twist.angular.z = max(
                         -self.ANGULAR_SPEED_MAX_AVOIDANCE,
-                        min(self.ANGULAR_SPEED_MAX_AVOIDANCE, self.avoidance_steering_cmd)
+                        min(
+                            self.ANGULAR_SPEED_MAX_AVOIDANCE,
+                            self.avoidance_steering_cmd,
+                        ),
                     )
                 else:
                     twist.angular.z = 0.0
