@@ -614,8 +614,8 @@ def visualize_control(frame, error, height, width):
 
 
 def main():
-    # cap = init_camera(2)
-    cap = init_camera("rsrc/camera_recording_20251128_113309.mp4")
+    cap = init_camera(2)
+    # cap = init_camera("rsrc/camera_recording_20251128_113309.mp4")
     model, class_names = load_yolo_model(MODEL_PATH)
     obstacle_model = load_obstacle_model(OBSTACLE_MODEL_ID)
 

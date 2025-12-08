@@ -105,7 +105,7 @@ class LineFollowerNode(Node):
 
         # Obstacle detection cooldown after stop sign
         self.OBSTACLE_DETECTION_COOLDOWN = (
-            3.0  # Seconds to ignore obstacles after stop sign
+            2.0  # Seconds to ignore obstacles after stop sign
         )
         self.last_stop_sign_detection_time = (
             None  # Track when stop sign was last detected
@@ -922,7 +922,7 @@ class LineFollowerNode(Node):
     def detect_and_annotate_signs(self, frame):
         """Detect signs using YOLO and annotate the frame."""
         detections = []
-        results = self.model(frame, conf=0.5, iou=0.45, verbose=False)
+        results = self.model(frame, conf=0.70, iou=0.45, verbose=False)
 
         for result in results:
             boxes = result.boxes
